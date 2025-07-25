@@ -212,7 +212,8 @@ class EvaluationRunner:
             DataFrame with coverage rates by method combination
         """
         coverage = results_df.groupby(['assignment_method', 'reporting_method']).apply(
-            lambda x: ((x['iroas_lower'] <= true_iroas) & (x['iroas_upper'] >= true_iroas)).mean()
+            lambda x: ((x['iroas_lower'] <= true_iroas) & (x['iroas_upper'] >= true_iroas)).mean(),
+            include_groups=False
         ).reset_index()
         coverage.columns = ['assignment_method', 'reporting_method', 'coverage_rate']
         

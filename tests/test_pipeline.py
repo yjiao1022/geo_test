@@ -146,6 +146,8 @@ class TestExperimentRunner:
         config = ExperimentConfig(
             n_geos=5,
             n_days=20,
+            pre_period_days=15,  # Must be less than n_days
+            eval_period_days=5,   # Must fit within remaining days
             n_simulations=3,  # Very small for testing
             n_bootstrap=10,
             seed=42
@@ -174,3 +176,43 @@ class TestExperimentRunner:
         # Check dimensions
         assert len(detailed_results) == 3  # n_simulations
         assert len(summary_results) == 1   # 1 method combination
+
+    def test_csv_export(self):
+        """Test CSV export functionality."""
+        import tempfile
+        import os
+        
+        config = ExperimentConfig(
+            n_geos=5,
+            n_days=20,
+            pre_period_days=15,  # Must be less than n_days
+            eval_period_days=5,   # Must fit within remaining days
+            n_simulations=2,
+            n_bootstrap=5,
+            seed=42
+        )
+        runner = ExperimentRunner(config)
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Run evaluation with CSV export
+            detailed_results, summary_results = runner.run_full_evaluation(
+                verbose=False,
+                save_csv=True,
+                output_dir=temp_dir
+            )
+            
+            # Check that CSV files were created
+            csv_files = [f for f in os.listdir(temp_dir) if f.endswith('.csv')]
+            assert len(csv_files) >= 2  # Should have detailed and summary results
+            
+            # Check that files contain expected data
+            detailed_csv = [f for f in csv_files if 'detailed_results' in f][0]
+            summary_csv = [f for f in csv_files if 'evaluation_summary' in f][0]
+            
+            # Load and verify CSV contents
+            detailed_from_csv = pd.read_csv(os.path.join(temp_dir, detailed_csv))
+            summary_from_csv = pd.read_csv(os.path.join(temp_dir, summary_csv))
+            
+            # Check that CSV data matches original results
+            pd.testing.assert_frame_equal(detailed_results, detailed_from_csv)
+            pd.testing.assert_frame_equal(summary_results, summary_from_csv)
