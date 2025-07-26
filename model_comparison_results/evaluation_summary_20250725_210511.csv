@@ -1,0 +1,5 @@
+assignment_method,reporting_method,mean_iroas,std_iroas,mean_ci_width,false_positive_rate,coverage_rate
+Random,GBR,-0.001,0.0118,0.0405,0.1,0.9
+Random,MeanMatching,3.3608,17.7037,76.9192,0.0,1.0
+Random,SCM,0.3396,1.1098,8.6225,0.1,0.9
+Random,TBR,0.2314,0.9589,1.6011,0.1667,0.8333333333333334

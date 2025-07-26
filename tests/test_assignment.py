@@ -568,7 +568,7 @@ class TestHybridEmbeddingAssignment:
                     'geo': geo_row['geo'],
                     'date': date,
                     'sales': base_sales + np.random.normal(0, 500),
-                    'spend_dollars': np.random.normal(5000, 1000)
+                    'spend': np.random.normal(5000, 1000)
                 })
         
         panel_df = pd.DataFrame(panel_data)

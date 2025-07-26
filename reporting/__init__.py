@@ -6,5 +6,6 @@ and computing treatment effects in geo-experiments.
 """
 
 from .models import MeanMatchingModel, GBRModel, TBRModel, SyntheticControlModel
+from .stgcn_model import STGCNReportingModel
 
-__all__ = ['MeanMatchingModel', 'GBRModel', 'TBRModel', 'SyntheticControlModel']
+__all__ = ['MeanMatchingModel', 'GBRModel', 'TBRModel', 'SyntheticControlModel', 'STGCNReportingModel']

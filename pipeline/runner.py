@@ -13,6 +13,7 @@ from assignment.methods import BaseAssignment, RandomAssignment
 from reporting.models import (
     BaseModel, MeanMatchingModel, GBRModel, TBRModel, SyntheticControlModel
 )
+from reporting.stgcn_model import STGCNReportingModel
 from evaluation.metrics import EvaluationRunner
 from diagnostics.plots import DiagnosticPlotter
 from .config import ExperimentConfig
@@ -45,7 +46,8 @@ class ExperimentRunner:
             'MeanMatching': MeanMatchingModel(),
             'GBR': GBRModel(),
             'TBR': TBRModel(),
-            'SCM': SyntheticControlModel()
+            'SCM': SyntheticControlModel(),
+            'STGCN': STGCNReportingModel()
         }
     
     def add_assignment_method(self, name: str, method: BaseAssignment) -> 'ExperimentRunner':

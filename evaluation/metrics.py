@@ -35,6 +35,7 @@ class EvaluationResult:
     iroas_lower: float
     iroas_upper: float
     ci_width: float
+    half_ci_width: float
     significant: bool
     
     def to_dict(self) -> Dict[str, Any]:
@@ -47,6 +48,7 @@ class EvaluationResult:
             'iroas_lower': self.iroas_lower,
             'iroas_upper': self.iroas_upper,
             'ci_width': self.ci_width,
+            'half_ci_width': self.half_ci_width,
             'significant': self.significant
         }
 
@@ -165,6 +167,7 @@ class EvaluationRunner:
         )
         
         ci_width = iroas_upper - iroas_lower
+        half_ci_width = ci_width / 2.0
         significant = (iroas_lower > 0) or (iroas_upper < 0)
         
         return EvaluationResult(
@@ -175,6 +178,7 @@ class EvaluationRunner:
             iroas_lower=iroas_lower,
             iroas_upper=iroas_upper,
             ci_width=ci_width,
+            half_ci_width=half_ci_width,
             significant=significant
         )
     
