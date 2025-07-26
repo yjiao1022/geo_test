@@ -272,3 +272,28 @@ class TestEndToEnd:
             # Check false positive rates are reasonable
             fprs = summary_results['false_positive_rate']
             assert all(0 <= fpr <= 1 for fpr in fprs), "All FPRs should be between 0 and 1"
+
+    def test_full_evaluation_with_all_reporting_models(self):
+        """Test that the full evaluation runs with all new reporting models."""
+        config = ExperimentConfig(
+            n_geos=15,
+            n_days=20,
+            pre_period_days=10,
+            eval_period_days=10,
+            n_simulations=2, # Minimal simulations
+            n_bootstrap=5,   # Minimal bootstrap
+            seed=2025
+        )
+
+        # The runner now includes all models by default
+        runner = ExperimentRunner(config)
+
+        detailed_results, summary_results = runner.run_full_evaluation(verbose=False)
+
+        # Check that all reporting methods were run and are in the summary
+        reporting_methods_in_summary = set(summary_results['reporting_method'].unique())
+        expected_methods = {'MeanMatching', 'GBR', 'TBR', 'SCM'}
+
+        assert expected_methods.issubset(reporting_methods_in_summary)
+        # Check that we have results for each model (2 sims * 4 models = 8 rows)
+        assert len(detailed_results) == 8

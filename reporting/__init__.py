@@ -5,6 +5,6 @@ This module provides different models for generating counterfactual estimates
 and computing treatment effects in geo-experiments.
 """
 
-from .models import MeanMatchingModel
+from .models import MeanMatchingModel, GBRModel, TBRModel, SyntheticControlModel
 
-__all__ = ['MeanMatchingModel']
+__all__ = ['MeanMatchingModel', 'GBRModel', 'TBRModel', 'SyntheticControlModel']
