@@ -199,6 +199,52 @@ def build_spatial_adjacency_matrix(
     return edge_index, edge_weight
 
 
+def normalize_adjacency_matrix(adjacency: torch.Tensor, epsilon: float = 1e-8, max_norm: float = 1e4) -> torch.Tensor:
+    """
+    Normalize adjacency matrix with numerical stability protections.
+    
+    Applies symmetric normalization: D^(-1/2) * A * D^(-1/2)
+    where D is the degree matrix and A is the adjacency matrix.
+    
+    Args:
+        adjacency: Adjacency matrix tensor of shape [num_nodes, num_nodes]
+        epsilon: Small value to prevent division by zero (default: 1e-8)
+        max_norm: Maximum allowed norm value to prevent explosion (default: 1e4)
+        
+    Returns:
+        Normalized adjacency matrix with numerical stability guarantees
+    """
+    # Compute degree matrix
+    degree = torch.sum(adjacency, dim=1)  # [num_nodes]
+    
+    # Add epsilon to prevent division by zero and clamp to prevent explosion
+    degree_with_eps = degree + epsilon
+    deg_inv_sqrt = torch.pow(degree_with_eps, -0.5)
+    deg_inv_sqrt = torch.clamp(deg_inv_sqrt, max=max_norm)
+    
+    # Handle isolated nodes (degree = 0) by setting their norm to 0
+    isolated_mask = degree < epsilon
+    deg_inv_sqrt[isolated_mask] = 0.0
+    
+    # Create diagonal degree matrix
+    deg_matrix = torch.diag(deg_inv_sqrt)
+    
+    # Apply symmetric normalization: D^(-1/2) * A * D^(-1/2)
+    normalized_adj = torch.mm(torch.mm(deg_matrix, adjacency), deg_matrix)
+    
+    # Additional numerical stability checks
+    normalized_adj = torch.clamp(normalized_adj, min=-max_norm, max=max_norm)
+    
+    # Replace any NaN or Inf values with 0
+    normalized_adj = torch.where(
+        torch.isfinite(normalized_adj), 
+        normalized_adj, 
+        torch.zeros_like(normalized_adj)
+    )
+    
+    return normalized_adj
+
+
 def prepare_stgcn_data(
     panel_data: pd.DataFrame,
     geo_features: pd.DataFrame,

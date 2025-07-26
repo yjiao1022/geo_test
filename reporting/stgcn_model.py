@@ -110,6 +110,32 @@ class SpatioTemporalBlock(nn.Module):
             self.residual_proj = nn.Linear(in_channels, temporal_channels)
         else:
             self.residual_proj = nn.Identity()
+        
+        # Initialize weights with Xavier/Glorot uniform for ReLU activation
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """
+        Initialize all linear layers with Xavier/Glorot uniform initialization.
+        
+        This initialization is specifically designed for ReLU activations and
+        helps prevent vanishing/exploding gradients during training.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Xavier uniform initialization with gain for ReLU
+                nn.init.xavier_uniform_(module.weight, gain=nn.init.calculate_gain('relu'))
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.Conv1d):
+                # Xavier uniform for convolutional layers
+                nn.init.xavier_uniform_(module.weight, gain=nn.init.calculate_gain('relu'))
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                # Standard initialization for layer norm
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
     
     def forward(
         self,
@@ -247,6 +273,23 @@ class STGCNModel(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, output_features)
         
+        # Initialize weights with Xavier/Glorot uniform for numerical stability
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """
+        Initialize all model weights with Xavier/Glorot uniform initialization.
+        
+        This provides proper weight scaling for ReLU activations and helps
+        maintain gradient flow during training.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Xavier uniform initialization with ReLU gain
+                nn.init.xavier_uniform_(module.weight, gain=nn.init.calculate_gain('relu'))
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+        
     def forward(
         self,
         x: torch.Tensor,
@@ -304,7 +347,8 @@ class STGCNReportingModel(BaseModel):
         device: str = 'cpu',
         normalize_data: bool = True,  # Add data normalization option
         verbose: bool = True,  # Control training output verbosity
-        bias_threshold: float = 0.1  # Threshold for bias detection in null scenarios
+        bias_threshold: float = 0.1,  # Threshold for bias detection in null scenarios
+        strict_numerical_checks: bool = False  # Enable strict numerical error handling and anomaly detection
     ):
         """
         Initialize STGCN reporting model.
@@ -324,8 +368,9 @@ class STGCNReportingModel(BaseModel):
             early_stopping_patience: Patience for early stopping
             device: Device for computation ('cpu' or 'cuda')
             normalize_data: Whether to normalize input data
-            verbose: Whether to print training diagnostics and progress
-            bias_threshold: Threshold for detecting systematic bias in null scenarios
+            verbose: Control training output verbosity
+            bias_threshold: Threshold for bias detection in null scenarios
+            strict_numerical_checks: Enable strict numerical error handling and anomaly detection
         """
         super().__init__()
         
@@ -346,6 +391,7 @@ class STGCNReportingModel(BaseModel):
         self.normalize_data = normalize_data
         self.verbose = verbose
         self.bias_threshold = bias_threshold
+        self.strict_numerical_checks = strict_numerical_checks
         
         # Model components (initialized during fit)
         self.model = None
@@ -409,9 +455,57 @@ class STGCNReportingModel(BaseModel):
         
         return inputs, targets
     
+    def _enable_strict_numerical_checks(self):
+        """
+        Enable strict numerical error handling and anomaly detection.
+        
+        This sets up PyTorch and NumPy to treat numerical warnings as errors
+        and enables anomaly detection for gradient computation debugging.
+        """
+        if self.strict_numerical_checks:
+            # Enable PyTorch anomaly detection
+            torch.autograd.set_detect_anomaly(True)
+            
+            # Set NumPy to raise errors on numerical warnings
+            import numpy as np
+            np.seterr(all='raise')
+            
+            # Convert numerical warnings to errors
+            import warnings
+            warnings.filterwarnings("error", category=RuntimeWarning)
+            
+            if self.verbose:
+                print("🔧 Strict numerical checks enabled:")
+                print("   - PyTorch anomaly detection: ON")
+                print("   - NumPy error mode: ALL WARNINGS -> ERRORS")
+                print("   - Runtime warnings -> ERRORS")
+    
+    def _disable_strict_numerical_checks(self):
+        """
+        Disable strict numerical checking to restore normal operation.
+        """
+        if self.strict_numerical_checks:
+            # Disable PyTorch anomaly detection
+            torch.autograd.set_detect_anomaly(False)
+            
+            # Reset NumPy error handling
+            import numpy as np
+            np.seterr(all='warn')
+            
+            # Reset warnings
+            import warnings
+            warnings.resetwarnings()
+            
+            if self.verbose:
+                print("🔧 Strict numerical checks disabled")
+    
     def _normalize_data(self, data_tensor: torch.Tensor) -> torch.Tensor:
         """
         Normalize data to improve training stability.
+        
+        Uses both global and per-geo normalization for enhanced numerical stability:
+        1. Global normalization across all nodes and timesteps
+        2. Per-geo normalization to handle heterogeneous geo characteristics
         
         Args:
             data_tensor: Input tensor of shape [num_nodes, num_timesteps, num_features]
@@ -422,33 +516,76 @@ class STGCNReportingModel(BaseModel):
         if not self.normalize_data:
             return data_tensor
         
-        # Compute mean and std across all nodes and timesteps for each feature
-        # Shape: [num_features]
+        # Global normalization (existing approach)
         self.data_mean = data_tensor.mean(dim=(0, 1), keepdim=True)  # [1, 1, num_features]
         self.data_std = data_tensor.std(dim=(0, 1), keepdim=True)    # [1, 1, num_features]
         
-        # Avoid division by zero
-        self.data_std = torch.clamp(self.data_std, min=1e-6)
+        # Avoid division by zero with epsilon
+        self.data_std = torch.clamp(self.data_std, min=1e-8)
         
-        # Normalize
-        normalized = (data_tensor - self.data_mean) / self.data_std
+        # Apply global normalization first
+        globally_normalized = (data_tensor - self.data_mean) / self.data_std
         
-        return normalized
+        # Per-geo normalization for additional stability
+        # Normalize each geo's features across time dimension
+        per_geo_mean = globally_normalized.mean(dim=1, keepdim=True)  # [num_nodes, 1, num_features]
+        per_geo_std = globally_normalized.std(dim=1, keepdim=True)    # [num_nodes, 1, num_features]
+        
+        # Avoid division by zero and add numerical stability
+        per_geo_std = torch.clamp(per_geo_std, min=1e-8)
+        
+        # Apply per-geo normalization
+        fully_normalized = (globally_normalized - per_geo_mean) / per_geo_std
+        
+        # Store per-geo statistics for denormalization
+        self.per_geo_mean = per_geo_mean
+        self.per_geo_std = per_geo_std
+        
+        # Final numerical stability check
+        fully_normalized = torch.clamp(fully_normalized, min=-10.0, max=10.0)
+        
+        # Replace any remaining NaN or Inf values
+        fully_normalized = torch.where(
+            torch.isfinite(fully_normalized),
+            fully_normalized,
+            torch.zeros_like(fully_normalized)
+        )
+        
+        if self.verbose:
+            print(f"🔢 Enhanced Data Normalization Applied:")
+            print(f"   Global - Mean: {self.data_mean.flatten()}, Std: {self.data_std.flatten()}")
+            print(f"   Per-geo std range: {per_geo_std.min().item():.6f} to {per_geo_std.max().item():.6f}")
+            print(f"   Final range: {fully_normalized.min().item():.3f} to {fully_normalized.max().item():.3f}")
+        
+        return fully_normalized
     
     def _denormalize_data(self, normalized_tensor: torch.Tensor) -> torch.Tensor:
         """
         Denormalize data back to original scale.
         
+        Reverses both per-geo and global normalization applied in _normalize_data.
+        
         Args:
-            normalized_tensor: Normalized tensor
+            normalized_tensor: Fully normalized tensor
             
         Returns:
-            Denormalized tensor
+            Denormalized tensor in original scale
         """
         if not self.normalize_data or self.data_mean is None:
             return normalized_tensor
         
-        return normalized_tensor * self.data_std + self.data_mean
+        # Reverse per-geo normalization first
+        if hasattr(self, 'per_geo_mean') and self.per_geo_mean is not None:
+            # Undo per-geo normalization
+            per_geo_denormalized = normalized_tensor * self.per_geo_std + self.per_geo_mean
+        else:
+            # Fallback if per-geo stats not available
+            per_geo_denormalized = normalized_tensor
+        
+        # Reverse global normalization
+        globally_denormalized = per_geo_denormalized * self.data_std + self.data_mean
+        
+        return globally_denormalized
     
     def _monitor_gradients(self) -> dict:
         """
@@ -725,53 +862,57 @@ class STGCNReportingModel(BaseModel):
         Returns:
             Self for method chaining
         """
-        # Store data for later use
-        self.assignment_df = assignment_df.copy()
+        # Enable strict numerical checks if requested
+        self._enable_strict_numerical_checks()
         
-        # Filter to pre-period data
-        panel_data['date'] = pd.to_datetime(panel_data['date'])
-        pre_period_end = pd.to_datetime(pre_period_end)
-        
-        pre_data = panel_data[panel_data['date'] < pre_period_end].copy()
-        self.pre_period_data = pre_data
-        
-        if len(pre_data) == 0:
-            raise ValueError("No pre-period data found")
-        
-        # Create geo features with spatial coordinates
-        geo_features = self._create_geo_features(pre_data, assignment_df)
-        
-        # Build spatial graph
-        self.edge_index, self.edge_weight = build_spatial_adjacency_matrix(
+        try:
+            # Store data for later use
+            self.assignment_df = assignment_df.copy()
+            
+            # Filter to pre-period data
+            panel_data['date'] = pd.to_datetime(panel_data['date'])
+            pre_period_end = pd.to_datetime(pre_period_end)
+            
+            pre_data = panel_data[panel_data['date'] < pre_period_end].copy()
+            self.pre_period_data = pre_data
+            
+            if len(pre_data) == 0:
+                raise ValueError("No pre-period data found")
+            
+            # Create geo features with spatial coordinates
+            geo_features = self._create_geo_features(pre_data, assignment_df)
+            
+            # Build spatial graph
+            self.edge_index, self.edge_weight = build_spatial_adjacency_matrix(
             geo_features,
             spatial_cols=['xy1', 'xy2'],
             connection_method=self.spatial_connection_method,
             k_neighbors=self.k_neighbors,
             include_self_loops=False
-        )
-        
-        # Move to device
-        self.edge_index = self.edge_index.to(self.device)
-        self.edge_weight = self.edge_weight.to(self.device)
-        
-        # Prepare time-series data
-        data_tensor, self.geo_to_idx = prepare_stgcn_data(
+            )
+            
+            # Move to device
+            self.edge_index = self.edge_index.to(self.device)
+            self.edge_weight = self.edge_weight.to(self.device)
+            
+            # Prepare time-series data
+            data_tensor, self.geo_to_idx = prepare_stgcn_data(
             pre_data,
             geo_features,
             feature_cols=self.feature_cols
-        )
-        
-        data_tensor = data_tensor.to(self.device)
-        
-        # Validate input data scale and provide recommendations
-        self._validate_data_scale(data_tensor)
-        
-        # Normalize data for better training stability
-        data_tensor = self._normalize_data(data_tensor)
-        
-        # Initialize model
-        num_features = len(self.feature_cols)
-        self.model = STGCNModel(
+            )
+            
+            data_tensor = data_tensor.to(self.device)
+            
+            # Validate input data scale and provide recommendations
+            self._validate_data_scale(data_tensor)
+            
+            # Normalize data for better training stability
+            data_tensor = self._normalize_data(data_tensor)
+            
+            # Initialize model
+            num_features = len(self.feature_cols)
+            self.model = STGCNModel(
             num_features=num_features,
             hidden_dim=self.hidden_dim,
             num_st_blocks=self.num_st_blocks,
@@ -779,190 +920,217 @@ class STGCNReportingModel(BaseModel):
             dropout=self.dropout,
             use_attention=self.use_attention,
             output_features=num_features
-        ).to(self.device)
-        
-        # Create training sequences
-        # Split data into training and validation sets
-        num_timesteps = data_tensor.shape[1]
-        
-        # Ensure validation set has enough timesteps for window_size
-        min_val_timesteps = self.window_size + 2  # Need at least window_size + 1 for sequences
-        max_split_idx = num_timesteps - min_val_timesteps
-        
-        if max_split_idx <= self.window_size:
-            # Not enough data for proper split, use all data for training
-            train_inputs, train_targets = self._create_sequences(data_tensor, self.window_size)
-            val_inputs, val_targets = train_inputs[-1:], train_targets[-1:]  # Use last training sample for validation
-        else:
-            split_idx = min(int(num_timesteps * 0.8), max_split_idx)
-            train_data = data_tensor[:, :split_idx, :]
-            val_data = data_tensor[:, split_idx:, :]
+            ).to(self.device)
             
-            train_inputs, train_targets = self._create_sequences(train_data, self.window_size)
-            val_inputs, val_targets = self._create_sequences(val_data, self.window_size)
-        
-        # Training setup
-        optimizer = Adam(self.model.parameters(), lr=self.learning_rate)
-        criterion = nn.MSELoss()
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
-        
-        best_val_loss = float('inf')
-        patience_counter = 0
-        
-        # Initialize training diagnostics
-        self.training_warnings = []
-        loss_history = []
-        val_loss_history = []
-        gradient_history = []
-        
-        # Training loop
-        if self.verbose:
-            print(f"Training STGCN model for {self.epochs} epochs...")
-        
-        # Use tqdm only if verbose
-        epoch_iterator = tqdm(range(self.epochs), desc="Training STGCN") if self.verbose else range(self.epochs)
-        
-        for epoch in epoch_iterator:
-            self.model.train()
-            total_loss = 0.0
+            # Create training sequences
+            # Split data into training and validation sets
+            num_timesteps = data_tensor.shape[1]
             
-            # Full batch training (could be extended to mini-batches)
-            for i in range(len(train_inputs)):
-                optimizer.zero_grad()
-                
-                # Forward pass
-                input_seq = train_inputs[i]  # [num_nodes, window_size, num_features]
-                target = train_targets[i]    # [num_nodes, num_features]
-                
-                # Model expects last timestep for prediction
-                pred = self.model(
-                    input_seq,
-                    self.edge_index,
-                    self.edge_weight
-                )[:, -1, :]  # Take last timestep: [num_nodes, num_features]
-                
-                # Compute loss
-                loss = criterion(pred, target)
-                
-                # Backward pass
-                loss.backward()
-
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                # Monitor gradients
-                gradient_stats = self._monitor_gradients()
-                
-                optimizer.step()
-                
-                total_loss += loss.item()
+            # Ensure validation set has enough timesteps for window_size
+            min_val_timesteps = self.window_size + 2  # Need at least window_size + 1 for sequences
+            max_split_idx = num_timesteps - min_val_timesteps
             
-            avg_loss = total_loss / len(train_inputs)
-            loss_history.append(avg_loss)
+            if max_split_idx <= self.window_size:
+                # Not enough data for proper split, use all data for training
+                train_inputs, train_targets = self._create_sequences(data_tensor, self.window_size)
+                val_inputs, val_targets = train_inputs[-1:], train_targets[-1:]  # Use last training sample for validation
+            else:
+                split_idx = min(int(num_timesteps * 0.8), max_split_idx)
+                train_data = data_tensor[:, :split_idx, :]
+                val_data = data_tensor[:, split_idx:, :]
+                
+                train_inputs, train_targets = self._create_sequences(train_data, self.window_size)
+                val_inputs, val_targets = self._create_sequences(val_data, self.window_size)
             
-            # Validation
-            self.model.eval()
-            total_val_loss = 0.0
-            with torch.no_grad():
-                for i in range(len(val_inputs)):
-                    input_seq = val_inputs[i]
-                    target = val_targets[i]
+            # Training setup
+            optimizer = Adam(self.model.parameters(), lr=self.learning_rate)
+            criterion = nn.MSELoss()
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+            
+            best_val_loss = float('inf')
+            patience_counter = 0
+            
+            # Initialize training diagnostics
+            self.training_warnings = []
+            loss_history = []
+            val_loss_history = []
+            gradient_history = []
+            
+            # Training loop
+            if self.verbose:
+                print(f"Training STGCN model for {self.epochs} epochs...")
+            
+            # Use tqdm only if verbose
+            epoch_iterator = tqdm(range(self.epochs), desc="Training STGCN") if self.verbose else range(self.epochs)
+            
+            for epoch in epoch_iterator:
+                self.model.train()
+                total_loss = 0.0
+                
+                # Full batch training (could be extended to mini-batches)
+                for i in range(len(train_inputs)):
+                    optimizer.zero_grad()
+                    
+                    # Forward pass
+                    input_seq = train_inputs[i]  # [num_nodes, window_size, num_features]
+                    target = train_targets[i]    # [num_nodes, num_features]
+                    
+                    # Model expects last timestep for prediction
                     pred = self.model(
                         input_seq,
                         self.edge_index,
                         self.edge_weight
-                    )[:, -1, :]
-                    val_loss = criterion(pred, target)
-                    total_val_loss += val_loss.item()
-            
-            avg_val_loss = total_val_loss / len(val_inputs)
-            val_loss_history.append(avg_val_loss)
-            
-            gradient_history.append(gradient_stats)
-            
-            # Check training health and collect warnings
-            epoch_warnings = self._check_training_health(epoch + 1, avg_loss, gradient_stats)
-            if epoch_warnings:
-                self.training_warnings.extend(epoch_warnings)
-                
-                # Print critical warnings immediately
-                for warning in epoch_warnings:
-                    if "🚨" in warning:
-                        print(warning)
-            
-            # Early stopping based on validation loss
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= self.early_stopping_patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
+                    )[:, -1, :]  # Take last timestep: [num_nodes, num_features]
+                    
+                    # Compute loss
+                    loss = criterion(pred, target)
+                    
+                    # Backward pass
+                    loss.backward()
 
-            scheduler.step(avg_val_loss)
-        
-        # Store comprehensive training diagnostics
-        self.training_diagnostics = {
-            'final_train_loss': avg_loss,
-            'final_val_loss': best_val_loss,
-            'epochs_trained': epoch + 1,
-            'early_stopped': patience_counter >= self.early_stopping_patience,
-            'loss_history': loss_history,
-            'val_loss_history': val_loss_history,
-            'initial_loss': loss_history[0] if loss_history else None,
-            'loss_reduction_ratio': loss_history[0] / avg_loss if loss_history and avg_loss > 0 else None,
-            'final_gradient_stats': gradient_history[-1] if gradient_history else {},
-            'gradient_health': {
-                'vanishing_gradients_detected': any(
-                    stats.get('total_norm', 0) < 1e-6 for stats in gradient_history[-5:]
-                ) if len(gradient_history) >= 5 else False,
-                'exploding_gradients_detected': any(
-                    stats.get('total_norm', 0) > 1e3 for stats in gradient_history[-5:]
-                ) if len(gradient_history) >= 5 else False,
-                'zero_grad_issues': any(
-                    stats.get('zero_grad_ratio', 0) > 0.5 for stats in gradient_history[-5:]
-                ) if len(gradient_history) >= 5 else False
-            },
-            'convergence_assessment': 'good' if best_val_loss < 1.0 else 'poor' if best_val_loss > 1e3 else 'moderate'
-        }
-        
-        # Compute training residuals for confidence intervals
-        self._compute_training_residuals(train_inputs, train_targets)
-        
-        self.is_fitted = True
-        
-        # Store loss trajectory for analysis
-        self.training_losses = loss_history
-        
-        # Print final training summary
-        if self.verbose:
-            print(f"STGCN training completed. Final loss: {best_val_loss:.6f}")
-            if self.training_warnings:
-                print(f"⚠️ Training completed with {len(self.training_warnings)} warnings.")
-                print("   Use model.get_training_diagnostics() for detailed analysis.")
-        
-        # Print convergence assessment
-        convergence = self.training_diagnostics['convergence_assessment']
-        if self.verbose:
-            if convergence == 'good':
-                print("✅ Model training converged well!")
-                print(f"   Final loss: {best_val_loss:.6f}, Converged at epoch: {epoch + 1}")
-            elif convergence == 'moderate':
-                print("⚠️ Model training had moderate convergence. Consider tuning hyperparameters.")
-                print(f"   Final loss: {best_val_loss:.6f}")
-            else:
-                print("🚨 Model training converged poorly. Check diagnostics and consider:")
-                print("   - Increasing learning rate or epochs")
-                print("   - Enabling data normalization")
-                print("   - Adjusting model architecture")
-                print(f"   Final loss: {best_val_loss:.6f}")
-        
-        # Perform null scenario bias detection
-        self._detect_null_bias()
-        
-        return self
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    # Monitor gradients
+                    gradient_stats = self._monitor_gradients()
+                    
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                
+                avg_loss = total_loss / len(train_inputs)
+                loss_history.append(avg_loss)
+                
+                # Critical numerical stability check for training loss
+                if not torch.isfinite(torch.tensor(avg_loss)):
+                    print(f"🚨 CRITICAL: Training loss is {avg_loss} at epoch {epoch+1}")
+                    print("🚨 Training diverged - terminating immediately!")
+                    break
+            
+                # Validation
+                self.model.eval()
+                total_val_loss = 0.0
+                with torch.no_grad():
+                    for i in range(len(val_inputs)):
+                        input_seq = val_inputs[i]
+                        target = val_targets[i]
+                        pred = self.model(
+                            input_seq,
+                            self.edge_index,
+                            self.edge_weight
+                        )[:, -1, :]
+                        val_loss = criterion(pred, target)
+                        total_val_loss += val_loss.item()
+                
+                avg_val_loss = total_val_loss / len(val_inputs)
+                val_loss_history.append(avg_val_loss)
+                
+                # Critical numerical stability check for validation loss
+                if not torch.isfinite(torch.tensor(avg_val_loss)):
+                    print(f"🚨 CRITICAL: Validation loss is {avg_val_loss} at epoch {epoch+1}")
+                    print("🚨 Validation diverged - terminating immediately!")
+                    break
+                
+                gradient_history.append(gradient_stats)
+                
+                # Check training health and collect warnings
+                epoch_warnings = self._check_training_health(epoch + 1, avg_loss, gradient_stats)
+                if epoch_warnings:
+                    self.training_warnings.extend(epoch_warnings)
+                    
+                    # Print critical warnings immediately
+                    for warning in epoch_warnings:
+                        if "🚨" in warning:
+                            print(warning)
+                
+                # Enhanced early stopping with numerical stability checks
+                if torch.isfinite(torch.tensor(avg_val_loss)) and avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    
+                # Stop if validation hasn't improved for patience epochs OR if loss is too high
+                if patience_counter >= self.early_stopping_patience:
+                    if self.verbose:
+                        print(f"⏹️ Early stopping at epoch {epoch+1} (patience exceeded)")
+                    break
+                
+                # Additional safety check - stop if validation loss is extremely high
+                if avg_val_loss > 1e6:
+                    print(f"🚨 CRITICAL: Validation loss extremely high ({avg_val_loss:.2e}) - stopping training")
+                    break
+
+                scheduler.step(avg_val_loss)
+            
+            # Store comprehensive training diagnostics
+            self.training_diagnostics = {
+                'final_train_loss': avg_loss,
+                'final_val_loss': best_val_loss,
+                'epochs_trained': epoch + 1,
+                'early_stopped': patience_counter >= self.early_stopping_patience,
+                'loss_history': loss_history,
+                'val_loss_history': val_loss_history,
+                'initial_loss': loss_history[0] if loss_history else None,
+                'loss_reduction_ratio': loss_history[0] / avg_loss if loss_history and avg_loss > 0 else None,
+                'final_gradient_stats': gradient_history[-1] if gradient_history else {},
+                'gradient_health': {
+                    'vanishing_gradients_detected': any(
+                        stats.get('total_norm', 0) < 1e-6 for stats in gradient_history[-5:]
+                    ) if len(gradient_history) >= 5 else False,
+                    'exploding_gradients_detected': any(
+                        stats.get('total_norm', 0) > 1e3 for stats in gradient_history[-5:]
+                    ) if len(gradient_history) >= 5 else False,
+                    'zero_grad_issues': any(
+                        stats.get('zero_grad_ratio', 0) > 0.5 for stats in gradient_history[-5:]
+                    ) if len(gradient_history) >= 5 else False
+                },
+                'convergence_assessment': 'good' if best_val_loss < 1.0 else 'poor' if best_val_loss > 1e3 else 'moderate'
+            }
+            
+            # Compute training residuals for confidence intervals
+            self._compute_training_residuals(train_inputs, train_targets)
+            
+            self.is_fitted = True
+            
+            # Store loss trajectory for analysis
+            self.training_losses = loss_history
+            
+            # Print final training summary
+            if self.verbose:
+                print(f"STGCN training completed. Final loss: {best_val_loss:.6f}")
+                if self.training_warnings:
+                    print(f"⚠️ Training completed with {len(self.training_warnings)} warnings.")
+                    print("   Use model.get_training_diagnostics() for detailed analysis.")
+            
+            # Print convergence assessment
+            convergence = self.training_diagnostics['convergence_assessment']
+            if self.verbose:
+                if convergence == 'good':
+                    print("✅ Model training converged well!")
+                    print(f"   Final loss: {best_val_loss:.6f}, Converged at epoch: {epoch + 1}")
+                elif convergence == 'moderate':
+                    print("⚠️ Model training had moderate convergence. Consider tuning hyperparameters.")
+                    print(f"   Final loss: {best_val_loss:.6f}")
+                else:
+                    print("🚨 Model training converged poorly. Check diagnostics and consider:")
+                    print("   - Increasing learning rate or epochs")
+                    print("   - Enabling data normalization")
+                    print("   - Adjusting model architecture")
+                    print(f"   Final loss: {best_val_loss:.6f}")
+            
+            # Perform null scenario bias detection
+            self._detect_null_bias()
+            
+            return self
+            
+        except Exception as e:
+            if self.strict_numerical_checks and self.verbose:
+                print(f"🚨 Training failed with strict numerical checks: {type(e).__name__}: {e}")
+            raise
+        finally:
+            # Always disable strict checks after training
+            self._disable_strict_numerical_checks()
     
     def _create_geo_features(
         self,
