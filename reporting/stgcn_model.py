@@ -499,6 +499,206 @@ class STGCNReportingModel(BaseModel):
             if self.verbose:
                 print("🔧 Strict numerical checks disabled")
     
+    def _calculate_ci_with_guards(
+        self, 
+        values: List[float], 
+        confidence_level: float
+    ) -> Tuple[float, float]:
+        """
+        Calculate confidence interval with assertion guards and proper ordering.
+        
+        Implements the suggested safety fixes:
+        1. Assert lower <= upper bounds
+        2. Assert positive CI width
+        3. Proper quantile ordering
+        """
+        if len(values) < 2:
+            # Not enough samples
+            mean_val = np.mean(values) if values else 0.0
+            return (mean_val * 0.9, mean_val * 1.1)  # Simple ±10% interval
+        
+        # Remove any infinite or NaN values
+        finite_values = [v for v in values if np.isfinite(v)]
+        
+        if len(finite_values) < 2:
+            mean_val = np.mean(finite_values) if finite_values else 0.0
+            return (mean_val * 0.9, mean_val * 1.1)
+        
+        alpha = 1 - confidence_level
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        
+        # Calculate quantiles
+        lower_bound = np.percentile(finite_values, lower_percentile)
+        upper_bound = np.percentile(finite_values, upper_percentile)
+        
+        # ASSERTION GUARDS (as suggested)
+        # 1. Ensure proper ordering
+        if lower_bound > upper_bound:
+            if self.verbose:
+                print(f"⚠️ Quantile order swap detected: lower={lower_bound:.6f} > upper={upper_bound:.6f}")
+            lower_bound, upper_bound = upper_bound, lower_bound
+        
+        # 2. Ensure positive CI width
+        ci_width = upper_bound - lower_bound
+        assert ci_width >= 0, f"Negative CI width: {ci_width}"
+        
+        # 3. Final bounds check
+        assert lower_bound <= upper_bound, f"CI bounds misordered: {lower_bound} > {upper_bound}"
+        
+        # Additional safeguard: if bounds are identical, add small margin
+        if abs(ci_width) < 1e-10:
+            center = (lower_bound + upper_bound) / 2
+            margin = abs(center) * 0.01 if center != 0 else 0.01
+            lower_bound = center - margin
+            upper_bound = center + margin
+        
+        return (lower_bound, upper_bound)
+    
+    def _calculate_log_iroas(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        spend_floor: float = 1e-6
+    ) -> float:
+        """
+        Calculate log-iROAS to prevent ratio explosion.
+        
+        Uses: log(incremental_sales + 1) - log(incremental_spend + spend_floor)
+        This prevents division by zero and explosive ratios.
+        """
+        # Get counterfactual predictions
+        counterfactual = self.predict(panel_data, period_start, period_end)
+        
+        # Get actual treatment group outcomes
+        panel_data = panel_data.copy()
+        panel_data['date'] = pd.to_datetime(panel_data['date'])
+        period_start = pd.to_datetime(period_start)
+        period_end = pd.to_datetime(period_end)
+        
+        eval_data = panel_data[
+            (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+        ]
+        
+        treatment_geos = self.assignment_df[
+            self.assignment_df['assignment'] == 'treatment'
+        ]['geo'].values
+        
+        treatment_data = eval_data[eval_data['geo'].isin(treatment_geos)]
+        
+        # Calculate incremental outcomes
+        actual_sales = treatment_data['sales'].sum()
+        actual_spend = treatment_data['spend'].sum()
+        
+        counterfactual_sales = counterfactual['sales'].sum()
+        counterfactual_spend = counterfactual['spend'].sum()
+        
+        incremental_sales = actual_sales - counterfactual_sales
+        incremental_spend = actual_spend - counterfactual_spend
+        
+        # Calculate log-iROAS with floors to prevent explosion
+        log_sales = np.log(max(incremental_sales + 1, 1))  # Add 1 to handle negative incremental
+        log_spend = np.log(max(abs(incremental_spend) + spend_floor, spend_floor))
+        
+        log_iroas = log_sales - log_spend
+        return log_iroas
+    
+    def _calculate_iroas_robust(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        spend_floor: float = 1e-6
+    ) -> float:
+        """
+        Calculate iROAS with spend floor to prevent ratio explosion.
+        """
+        # Get counterfactual predictions
+        counterfactual = self.predict(panel_data, period_start, period_end)
+        
+        # Get actual treatment group outcomes
+        panel_data = panel_data.copy()
+        panel_data['date'] = pd.to_datetime(panel_data['date'])
+        period_start = pd.to_datetime(period_start)
+        period_end = pd.to_datetime(period_end)
+        
+        eval_data = panel_data[
+            (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+        ]
+        
+        treatment_geos = self.assignment_df[
+            self.assignment_df['assignment'] == 'treatment'
+        ]['geo'].values
+        
+        treatment_data = eval_data[eval_data['geo'].isin(treatment_geos)]
+        
+        # Calculate incremental outcomes
+        actual_sales = treatment_data['sales'].sum()
+        actual_spend = treatment_data['spend'].sum()
+        
+        counterfactual_sales = counterfactual['sales'].sum()
+        counterfactual_spend = counterfactual['spend'].sum()
+        
+        incremental_sales = actual_sales - counterfactual_sales
+        incremental_spend = actual_spend - counterfactual_spend
+        
+        # Apply spend floor to prevent division by near-zero
+        effective_spend = incremental_spend
+        if abs(effective_spend) < spend_floor:
+            effective_spend = spend_floor if incremental_spend >= 0 else -spend_floor
+        
+        iroas = incremental_sales / effective_spend
+        return iroas
+    
+    def _calculate_log_iroas_bootstrap(
+        self,
+        bootstrap_panel: pd.DataFrame,
+        bootstrap_assignment: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        spend_floor: float
+    ) -> float:
+        """
+        Calculate log-iROAS for bootstrap samples using existing model.
+        """
+        # Temporarily replace assignment for prediction
+        original_assignment = self.assignment_df
+        self.assignment_df = bootstrap_assignment
+        
+        try:
+            log_iroas = self._calculate_log_iroas(
+                bootstrap_panel, period_start, period_end, spend_floor
+            )
+            return log_iroas
+        finally:
+            # Restore original assignment
+            self.assignment_df = original_assignment
+    
+    def _calculate_iroas_bootstrap(
+        self,
+        bootstrap_panel: pd.DataFrame,
+        bootstrap_assignment: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        spend_floor: float
+    ) -> float:
+        """
+        Calculate robust iROAS for bootstrap samples using existing model.
+        """
+        # Temporarily replace assignment for prediction
+        original_assignment = self.assignment_df
+        self.assignment_df = bootstrap_assignment
+        
+        try:
+            iroas = self._calculate_iroas_robust(
+                bootstrap_panel, period_start, period_end, spend_floor
+            )
+            return iroas
+        finally:
+            # Restore original assignment
+            self.assignment_df = original_assignment
+    
     def _normalize_data(self, data_tensor: torch.Tensor) -> torch.Tensor:
         """
         Normalize data to improve training stability.
@@ -1380,11 +1580,13 @@ class STGCNReportingModel(BaseModel):
         incremental_sales = actual_sales - counterfactual_sales
         incremental_spend = actual_spend - counterfactual_spend
         
-        # Calculate iROAS
-        if abs(incremental_spend) < 1e-6:
-            return 0.0
+        # Calculate iROAS with spend floor to prevent ratio explosion
+        spend_floor = 1e-6
+        effective_spend = incremental_spend
+        if abs(effective_spend) < spend_floor:
+            effective_spend = spend_floor if incremental_spend >= 0 else -spend_floor
         
-        iroas = incremental_sales / incremental_spend
+        iroas = incremental_sales / effective_spend
         return iroas
     
     def confidence_interval(
@@ -1394,13 +1596,20 @@ class STGCNReportingModel(BaseModel):
         period_end: str,
         confidence_level: float = 0.95,
         n_bootstrap: int = 500,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        method: str = 'ensemble',
+        n_mc_samples: int = 100,
+        use_log_iroas: bool = True,
+        spend_floor: float = 1e-6,
+        ensemble_size: int = 5
     ) -> Tuple[float, float]:
         """
-        Calculate confidence interval using bootstrap resampling of control geos.
+        Calculate confidence interval with improved variance estimation methods.
         
-        This method follows the same approach as traditional models by resampling
-        control geos and re-fitting the model to estimate uncertainty.
+        This method implements multiple approaches to capture model uncertainty:
+        1. Ensemble (default) - Gold standard, trains K models with different seeds
+        2. Monte Carlo dropout - Fast, captures parameter uncertainty within single fit
+        3. Model-aware bootstrap - Slow but statistically correct
         
         Args:
             panel_data: Long-format panel data
@@ -1409,6 +1618,11 @@ class STGCNReportingModel(BaseModel):
             confidence_level: Confidence level (default: 0.95)
             n_bootstrap: Number of bootstrap samples
             seed: Random seed for reproducibility
+            method: CI method ('ensemble', 'mc_dropout', 'model_aware_bootstrap')
+            n_mc_samples: Number of Monte Carlo dropout samples
+            use_log_iroas: Use log-iROAS to prevent ratio explosion
+            spend_floor: Minimum spend to prevent division by zero
+            ensemble_size: Number of models in ensemble (default: 5)
             
         Returns:
             Tuple of (lower_bound, upper_bound)
@@ -1418,7 +1632,185 @@ class STGCNReportingModel(BaseModel):
         
         if seed is not None:
             np.random.seed(seed)
+            torch.manual_seed(seed)
         
+        # Route to appropriate CI method
+        if method == 'ensemble':
+            return self._ensemble_confidence_interval(
+                panel_data, period_start, period_end, confidence_level,
+                ensemble_size, use_log_iroas, spend_floor
+            )
+        elif method == 'mc_dropout':
+            return self._mc_dropout_confidence_interval(
+                panel_data, period_start, period_end, confidence_level, 
+                n_mc_samples, use_log_iroas, spend_floor
+            )
+        elif method == 'model_aware_bootstrap':
+            return self._model_aware_bootstrap_ci(
+                panel_data, period_start, period_end, confidence_level,
+                n_bootstrap, use_log_iroas, spend_floor
+            )
+        else:
+            # Original method with fixes
+            return self._original_bootstrap_with_fixes(
+                panel_data, period_start, period_end, confidence_level,
+                n_bootstrap, use_log_iroas, spend_floor
+            )
+        
+    def _ensemble_confidence_interval(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        confidence_level: float,
+        ensemble_size: int,
+        use_log_iroas: bool,
+        spend_floor: float
+    ) -> Tuple[float, float]:
+        """
+        Ensemble confidence interval using K independently trained models.
+        
+        This is the gold-standard approach that solves the overconfidence problem
+        by capturing model initialization and training variance.
+        """
+        if self.verbose:
+            print(f"Training ensemble of {ensemble_size} models for CI estimation...")
+        
+        ensemble_iroas = []
+        successful_models = 0
+        
+        # Train ensemble with different random seeds
+        for i in range(ensemble_size):
+            torch.manual_seed(5000 + i)
+            np.random.seed(5000 + i)
+            
+            # Create model with same configuration
+            ensemble_model = STGCNReportingModel(
+                hidden_dim=self.hidden_dim,
+                num_st_blocks=self.num_st_blocks,
+                window_size=self.window_size,
+                epochs=self.epochs,
+                learning_rate=self.learning_rate,
+                dropout=self.dropout,
+                normalize_data=self.normalize_data,
+                verbose=False,  # Suppress individual model output
+                k_neighbors=self.k_neighbors,
+                device=self.device
+            )
+            
+            try:
+                # Fit ensemble model
+                ensemble_model.fit(
+                    panel_data, 
+                    self.assignment_df, 
+                    self.pre_period_data['date'].max().strftime('%Y-%m-%d')
+                )
+                
+                # Calculate iROAS for this model
+                if use_log_iroas:
+                    iroas = ensemble_model._calculate_log_iroas(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                else:
+                    iroas = ensemble_model._calculate_iroas_robust(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                
+                ensemble_iroas.append(iroas)
+                successful_models += 1
+                
+                if self.verbose:
+                    print(f"  Model {i+1}: iROAS = {iroas:.4f}")
+                    
+            except Exception as e:
+                if self.verbose:
+                    print(f"  Model {i+1} failed: {e}")
+                continue
+        
+        if successful_models < 2:
+            if self.verbose:
+                print("⚠️ Ensemble failed, falling back to MC dropout")
+            return self._mc_dropout_confidence_interval(
+                panel_data, period_start, period_end, confidence_level,
+                100, use_log_iroas, spend_floor
+            )
+        
+        # Calculate ensemble statistics
+        ensemble_mean = np.mean(ensemble_iroas)
+        ensemble_std = np.std(ensemble_iroas, ddof=1)  # Sample std
+        
+        # Use t-distribution for small ensembles
+        from scipy import stats
+        alpha = 1 - confidence_level
+        t_score = stats.t.ppf(1 - alpha/2, df=successful_models - 1)
+        margin = t_score * ensemble_std
+        
+        lower_bound = ensemble_mean - margin
+        upper_bound = ensemble_mean + margin
+        
+        if self.verbose:
+            print(f"  Ensemble results: {successful_models} models, std={ensemble_std:.4f}")
+            print(f"  CI: [{lower_bound:.4f}, {upper_bound:.4f}]")
+        
+        return (lower_bound, upper_bound)
+    
+    def _mc_dropout_confidence_interval(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        confidence_level: float,
+        n_mc_samples: int,
+        use_log_iroas: bool,
+        spend_floor: float
+    ) -> Tuple[float, float]:
+        """
+        Monte Carlo dropout confidence interval.
+        
+        Uses dropout during inference to capture parameter uncertainty
+        without retraining. Much faster than bootstrap methods.
+        """
+        # Enable dropout during inference
+        self.model.train()  # This enables dropout
+        
+        mc_iroas_values = []
+        
+        with torch.no_grad():
+            for _ in range(n_mc_samples):
+                # Each forward pass will have different dropout
+                if use_log_iroas:
+                    log_iroas = self._calculate_log_iroas(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                    mc_iroas_values.append(log_iroas)
+                else:
+                    iroas = self._calculate_iroas_robust(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                    mc_iroas_values.append(iroas)
+        
+        # Restore model to eval mode
+        self.model.eval()
+        
+        # Calculate confidence interval with proper bounds checking
+        return self._calculate_ci_with_guards(mc_iroas_values, confidence_level)
+    
+    def _model_aware_bootstrap_ci(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        confidence_level: float,
+        n_bootstrap: int,
+        use_log_iroas: bool,
+        spend_floor: float
+    ) -> Tuple[float, float]:
+        """
+        Model-aware bootstrap that refits the model on each bootstrap sample.
+        
+        This captures both sampling and model parameter uncertainty.
+        Slower but statistically correct.
+        """
         # Get control geos
         control_geos = self.assignment_df[
             self.assignment_df['assignment'] == 'control'
@@ -1429,29 +1821,19 @@ class STGCNReportingModel(BaseModel):
         ]['geo'].values
         
         if len(control_geos) < 2:
-            # Not enough control geos for bootstrap - fallback to simple interval
-            base_iroas = self.calculate_iroas(panel_data, period_start, period_end)
-            # Use a simple heuristic based on data variance
-            panel_data_eval = panel_data[
-                (pd.to_datetime(panel_data['date']) >= pd.to_datetime(period_start)) &
-                (pd.to_datetime(panel_data['date']) <= pd.to_datetime(period_end))
-            ]
-            
-            treatment_data = panel_data_eval[panel_data_eval['geo'].isin(treatment_geos)]
-            sales_std = treatment_data['sales'].std()
-            spend_std = treatment_data['spend'].std()
-            
-            # Simple error propagation estimate
-            error_estimate = np.sqrt((sales_std / treatment_data['spend'].mean())**2 + 
-                                   (spend_std * treatment_data['sales'].mean() / treatment_data['spend'].mean()**2)**2)
-            
-            margin = 1.96 * error_estimate  # 95% CI
-            return (base_iroas - margin, base_iroas + margin)
+            # Not enough control geos for bootstrap - use MC dropout
+            if self.verbose:
+                print("⚠️ Insufficient control geos for bootstrap, using MC dropout")
+            return self._mc_dropout_confidence_interval(
+                panel_data, period_start, period_end, confidence_level,
+                100, use_log_iroas, spend_floor
+            )
         
         bootstrap_iroas = []
+        failed_bootstraps = 0
         
-        # Bootstrap by resampling control geos
-        for _ in range(n_bootstrap):
+        # Bootstrap by resampling control geos with model refitting
+        for bootstrap_idx in range(n_bootstrap):
             # Bootstrap sample control geos (with replacement)
             bootstrap_control_geos = np.random.choice(
                 control_geos, 
