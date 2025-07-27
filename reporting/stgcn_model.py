@@ -22,6 +22,7 @@ from typing import Dict, Tuple, Optional, List
 from abc import ABC, abstractmethod
 import warnings
 from tqdm import tqdm
+import scipy.stats
 
 # Try to import PyTorch Geometric, provide fallback if not available
 try:
@@ -2191,6 +2192,524 @@ class STGCNReportingModel(BaseModel):
             'bias_level': 'high' if relative_bias > threshold else 'moderate' if relative_bias > threshold/2 else 'low',
             'false_positive_risk': 'high' if relative_bias > threshold else 'medium' if relative_bias > threshold/2 else 'low'
         }
+    
+    def diagnose_ensemble_distribution(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        ensemble_size: int = 10,
+        use_log_iroas: bool = True,
+        spend_floor: float = 1e-6,
+        plot: bool = True
+    ) -> dict:
+        """
+        Diagnostic analysis of ensemble iROAS distribution to understand bias and variance.
+        
+        Args:
+            panel_data: Panel data for evaluation
+            period_start: Start of evaluation period
+            period_end: End of evaluation period
+            ensemble_size: Number of models in ensemble for diagnosis
+            use_log_iroas: Whether to use log-iROAS
+            spend_floor: Minimum spend floor
+            plot: Whether to create diagnostic plots
+            
+        Returns:
+            Dictionary with distribution statistics and diagnostic information
+        """
+        if self.verbose:
+            print(f"🔬 Running Ensemble Distribution Diagnosis (K={ensemble_size})...")
+        
+        # Collect ensemble iROAS values
+        ensemble_iroas = []
+        successful_models = 0
+        
+        # Train larger ensemble for better distribution analysis
+        for i in range(ensemble_size):
+            torch.manual_seed(6000 + i)  # Different seed space for diagnostics
+            np.random.seed(6000 + i)
+            
+            try:
+                # Create ensemble model
+                ensemble_model = STGCNReportingModel(
+                    hidden_dim=self.hidden_dim,
+                    num_st_blocks=self.num_st_blocks,
+                    window_size=self.window_size,
+                    epochs=self.epochs,
+                    learning_rate=self.learning_rate,
+                    dropout=self.dropout,
+                    normalize_data=self.normalize_data,
+                    verbose=False,
+                    k_neighbors=self.k_neighbors,
+                    device=self.device
+                )
+                
+                # Fit model
+                ensemble_model.fit(
+                    panel_data,
+                    self.assignment_df,
+                    self.pre_period_data['date'].max().strftime('%Y-%m-%d')
+                )
+                
+                # Calculate iROAS
+                if use_log_iroas:
+                    iroas = ensemble_model._calculate_log_iroas(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                else:
+                    iroas = ensemble_model._calculate_iroas_robust(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                
+                ensemble_iroas.append(iroas)
+                successful_models += 1
+                
+                if self.verbose and i % 2 == 0:
+                    print(f"  Model {i+1}/{ensemble_size}: iROAS = {iroas:.4f}")
+                    
+            except Exception as e:
+                if self.verbose:
+                    print(f"  Model {i+1} failed: {e}")
+                continue
+        
+        if successful_models < 3:
+            raise ValueError(f"Insufficient successful models ({successful_models}) for distribution analysis")
+        
+        # Calculate distribution statistics
+        ensemble_iroas = np.array(ensemble_iroas)
+        stats = {
+            'ensemble_size': successful_models,
+            'mean': np.mean(ensemble_iroas),
+            'median': np.median(ensemble_iroas),
+            'std': np.std(ensemble_iroas, ddof=1),
+            'min': np.min(ensemble_iroas),
+            'max': np.max(ensemble_iroas),
+            'q05': np.percentile(ensemble_iroas, 5),
+            'q25': np.percentile(ensemble_iroas, 25),
+            'q75': np.percentile(ensemble_iroas, 75),
+            'q95': np.percentile(ensemble_iroas, 95),
+            'skewness': scipy.stats.skew(ensemble_iroas) if len(ensemble_iroas) > 2 else 0,
+            'kurtosis': scipy.stats.kurtosis(ensemble_iroas) if len(ensemble_iroas) > 2 else 0,
+            'raw_values': ensemble_iroas.tolist()
+        }
+        
+        # Diagnostic analysis
+        bias_magnitude = abs(stats['mean'])
+        std_dev = stats['std']
+        ci_half_width = 1.96 * std_dev  # Approximate 95% CI half-width
+        
+        # Check if zero is plausibly in the distribution
+        zero_in_range = (stats['q05'] <= 0 <= stats['q95'])
+        
+        diagnostics = {
+            'bias_magnitude': bias_magnitude,
+            'bias_relative_to_std': bias_magnitude / std_dev if std_dev > 0 else float('inf'),
+            'ci_half_width': ci_half_width,
+            'zero_plausible': zero_in_range,
+            'distribution_symmetric': abs(stats['skewness']) < 0.5,
+            'heavy_tailed': abs(stats['kurtosis']) > 1.0,
+            'recommendation': self._generate_bias_correction_recommendation(stats)
+        }
+        
+        if self.verbose:
+            print(f"\n📊 Distribution Analysis Results:")
+            print(f"   Mean: {stats['mean']:.4f} ± {stats['std']:.4f}")
+            print(f"   95% Range: [{stats['q05']:.4f}, {stats['q95']:.4f}]")
+            print(f"   Bias magnitude: {bias_magnitude:.4f}")
+            print(f"   Zero plausible: {zero_in_range}")
+            print(f"   Distribution shape: skew={stats['skewness']:.2f}, kurt={stats['kurtosis']:.2f}")
+            print(f"   Recommendation: {diagnostics['recommendation']}")
+        
+        # Create diagnostic plots
+        if plot:
+            self._create_distribution_plots(ensemble_iroas, stats, diagnostics)
+        
+        return {**stats, **diagnostics}
+    
+    def _generate_bias_correction_recommendation(self, stats: dict) -> str:
+        """Generate recommendations based on distribution analysis."""
+        bias_mag = abs(stats['mean'])
+        std_dev = stats['std']
+        
+        if bias_mag > 2 * std_dev:
+            return "STRONG BIAS: Implement pre-period calibration immediately"
+        elif bias_mag > std_dev:
+            return "MODERATE BIAS: Consider bias correction and increase ensemble size"
+        elif std_dev > 5.0:
+            return "HIGH VARIANCE: Increase regularization and ensemble size"
+        elif abs(stats.get('skewness', 0)) > 1.0:
+            return "SKEWED DISTRIBUTION: Use bias-corrected bootstrap (BCa)"
+        else:
+            return "ACCEPTABLE: Minor calibration may help"
+    
+    def _create_distribution_plots(self, ensemble_iroas: np.ndarray, stats: dict, diagnostics: dict):
+        """Create diagnostic plots for ensemble distribution analysis."""
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            fig.suptitle('STGCN Ensemble iROAS Distribution Diagnostics', fontsize=16, fontweight='bold')
+            
+            # Plot 1: Histogram with statistics
+            axes[0, 0].hist(ensemble_iroas, bins=min(20, len(ensemble_iroas)//2), alpha=0.7, color='skyblue', edgecolor='black')
+            axes[0, 0].axvline(stats['mean'], color='red', linestyle='--', linewidth=2, label=f'Mean: {stats["mean"]:.3f}')
+            axes[0, 0].axvline(0, color='green', linestyle='-', linewidth=2, label='True Null (0)')
+            axes[0, 0].axvspan(stats['q05'], stats['q95'], alpha=0.2, color='orange', label='90% Range')
+            axes[0, 0].set_xlabel('iROAS')
+            axes[0, 0].set_ylabel('Frequency')
+            axes[0, 0].set_title('Ensemble iROAS Distribution')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Plot 2: Q-Q plot for normality check
+            from scipy import stats as scipy_stats
+            scipy_stats.probplot(ensemble_iroas, dist="norm", plot=axes[0, 1])
+            axes[0, 1].set_title('Q-Q Plot (Normality Check)')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Plot 3: Box plot with individual points
+            axes[1, 0].boxplot(ensemble_iroas, vert=True, patch_artist=True, 
+                             boxprops=dict(facecolor='lightblue', alpha=0.7))
+            axes[1, 0].scatter([1] * len(ensemble_iroas), ensemble_iroas, alpha=0.6, color='red', s=30)
+            axes[1, 0].axhline(0, color='green', linestyle='-', linewidth=2, label='True Null')
+            axes[1, 0].set_ylabel('iROAS')
+            axes[1, 0].set_title('Distribution Box Plot')
+            axes[1, 0].set_xticks([])
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Plot 4: Diagnostic summary text
+            axes[1, 1].axis('off')
+            summary_text = f"""
+DIAGNOSTIC SUMMARY
+
+Bias Analysis:
+• Mean iROAS: {stats['mean']:.4f}
+• Bias magnitude: {diagnostics['bias_magnitude']:.4f}
+• Bias/StdDev ratio: {diagnostics['bias_relative_to_std']:.2f}
+
+Variance Analysis:
+• Standard deviation: {stats['std']:.4f}
+• 95% CI half-width: {diagnostics['ci_half_width']:.4f}
+
+Distribution Shape:
+• Skewness: {stats['skewness']:.2f}
+• Kurtosis: {stats['kurtosis']:.2f}
+• Zero plausible: {diagnostics['zero_plausible']}
+
+Coverage Issues:
+• Heavy tailed: {diagnostics['heavy_tailed']}
+• Symmetric: {diagnostics['distribution_symmetric']}
+
+RECOMMENDATION:
+{diagnostics['recommendation']}
+            """
+            
+            axes[1, 1].text(0.05, 0.95, summary_text, transform=axes[1, 1].transAxes,
+                           fontsize=10, verticalalignment='top', fontfamily='monospace',
+                           bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+            
+            plt.tight_layout()
+            
+            # Save plot
+            plot_filename = f'stgcn_distribution_diagnostics_{pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")}.png'
+            plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+            print(f"📊 Diagnostic plots saved: {plot_filename}")
+            plt.show()
+            
+        except ImportError:
+            if self.verbose:
+                print("⚠️ Matplotlib/seaborn not available for plotting")
+        except Exception as e:
+            if self.verbose:
+                print(f"⚠️ Plotting failed: {e}")
+    
+    def apply_bias_correction(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        method: str = 'pre_period_calibration',
+        confidence_level: float = 0.95,
+        ensemble_size: int = 5,
+        use_log_iroas: bool = True,
+        spend_floor: float = 1e-6
+    ) -> dict:
+        """
+        Apply bias correction to improve confidence interval calibration.
+        
+        Args:
+            panel_data: Panel data for evaluation
+            period_start: Start of evaluation period  
+            period_end: End of evaluation period
+            method: Bias correction method ('pre_period_calibration', 'bca_bootstrap')
+            confidence_level: Confidence level for intervals
+            ensemble_size: Size of ensemble for correction
+            use_log_iroas: Whether to use log-iROAS
+            spend_floor: Minimum spend floor
+            
+        Returns:
+            Dictionary with original and corrected confidence intervals
+        """
+        if self.verbose:
+            print(f"🔧 Applying Bias Correction: {method}")
+        
+        # Get original ensemble confidence interval
+        original_lower, original_upper = self._ensemble_confidence_interval(
+            panel_data, period_start, period_end, confidence_level,
+            ensemble_size, use_log_iroas, spend_floor, n_jobs=1, use_parallel=False
+        )
+        
+        if method == 'pre_period_calibration':
+            corrected_lower, corrected_upper = self._pre_period_calibration(
+                panel_data, period_start, period_end, confidence_level,
+                ensemble_size, use_log_iroas, spend_floor
+            )
+        elif method == 'bca_bootstrap':
+            corrected_lower, corrected_upper = self._bca_bootstrap_ci(
+                panel_data, period_start, period_end, confidence_level,
+                ensemble_size, use_log_iroas, spend_floor
+            )
+        else:
+            raise ValueError(f"Unknown bias correction method: {method}")
+        
+        results = {
+            'method': method,
+            'original_ci': (original_lower, original_upper),
+            'corrected_ci': (corrected_lower, corrected_upper),
+            'original_width': original_upper - original_lower,
+            'corrected_width': corrected_upper - corrected_lower,
+            'bias_correction': (corrected_lower + corrected_upper)/2 - (original_lower + original_upper)/2,
+            'width_adjustment': (corrected_upper - corrected_lower) / (original_upper - original_lower)
+        }
+        
+        if self.verbose:
+            print(f"   Original CI: [{original_lower:.4f}, {original_upper:.4f}]")
+            print(f"   Corrected CI: [{corrected_lower:.4f}, {corrected_upper:.4f}]")
+            print(f"   Bias correction: {results['bias_correction']:.4f}")
+            print(f"   Width adjustment: {results['width_adjustment']:.2f}x")
+        
+        return results
+    
+    def _pre_period_calibration(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        confidence_level: float,
+        ensemble_size: int,
+        use_log_iroas: bool,
+        spend_floor: float
+    ) -> Tuple[float, float]:
+        """
+        Apply pre-period calibration to remove systematic bias.
+        
+        This method estimates systematic bias using the pre-period and subtracts it
+        from the evaluation period estimates.
+        """
+        if self.verbose:
+            print("   🔄 Estimating pre-period bias...")
+        
+        # Use the latter part of pre-period as a pseudo-evaluation period
+        pre_period_dates = sorted(self.pre_period_data['date'].unique())
+        
+        # Use last 20% of pre-period for bias estimation
+        bias_start_idx = int(len(pre_period_dates) * 0.8)
+        bias_start = pre_period_dates[bias_start_idx].strftime('%Y-%m-%d')
+        bias_end = pre_period_dates[-1].strftime('%Y-%m-%d')
+        
+        # Calculate bias using ensemble on pre-period
+        bias_estimates = []
+        
+        for i in range(ensemble_size):
+            torch.manual_seed(7000 + i)  # Different seed space for bias estimation
+            np.random.seed(7000 + i)
+            
+            try:
+                # Create bias estimation model
+                bias_model = STGCNReportingModel(
+                    hidden_dim=self.hidden_dim,
+                    num_st_blocks=self.num_st_blocks,
+                    window_size=self.window_size,
+                    epochs=self.epochs,
+                    learning_rate=self.learning_rate,
+                    dropout=self.dropout,
+                    normalize_data=self.normalize_data,
+                    verbose=False,
+                    k_neighbors=self.k_neighbors,
+                    device=self.device
+                )
+                
+                # Fit on earlier pre-period data
+                early_pre_period = self.pre_period_data[
+                    self.pre_period_data['date'] < pd.to_datetime(bias_start)
+                ]
+                
+                if len(early_pre_period) > 0:
+                    bias_model.fit(
+                        panel_data,
+                        self.assignment_df,
+                        early_pre_period['date'].max().strftime('%Y-%m-%d')
+                    )
+                    
+                    # Calculate "iROAS" on later pre-period (should be ~0)
+                    if use_log_iroas:
+                        bias_estimate = bias_model._calculate_log_iroas(
+                            panel_data, bias_start, bias_end, spend_floor
+                        )
+                    else:
+                        bias_estimate = bias_model._calculate_iroas_robust(
+                            panel_data, bias_start, bias_end, spend_floor
+                        )
+                    
+                    bias_estimates.append(bias_estimate)
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"     Bias model {i+1} failed: {e}")
+                continue
+        
+        # Calculate average bias
+        if len(bias_estimates) > 0:
+            systematic_bias = np.mean(bias_estimates)
+            if self.verbose:
+                print(f"   📏 Systematic bias estimated: {systematic_bias:.4f}")
+        else:
+            systematic_bias = 0.0
+            if self.verbose:
+                print("   ⚠️ Could not estimate bias - using original estimates")
+        
+        # Get original confidence interval
+        original_lower, original_upper = self._ensemble_confidence_interval_sequential(
+            panel_data, period_start, period_end, confidence_level,
+            ensemble_size, use_log_iroas, spend_floor
+        )
+        
+        # Apply bias correction
+        corrected_lower = original_lower - systematic_bias
+        corrected_upper = original_upper - systematic_bias
+        
+        return (corrected_lower, corrected_upper)
+    
+    def _bca_bootstrap_ci(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        confidence_level: float,
+        ensemble_size: int,
+        use_log_iroas: bool,
+        spend_floor: float
+    ) -> Tuple[float, float]:
+        """
+        Bias-Corrected and Accelerated (BCa) bootstrap confidence interval.
+        
+        This method provides better coverage for skewed distributions and
+        automatically corrects for bias and skewness.
+        """
+        if self.verbose:
+            print("   🔄 Computing BCa bootstrap confidence interval...")
+        
+        # Collect ensemble estimates for bias and acceleration correction
+        ensemble_estimates = []
+        
+        for i in range(ensemble_size):
+            torch.manual_seed(8000 + i)  # Different seed space for BCa
+            np.random.seed(8000 + i)
+            
+            try:
+                ensemble_model = STGCNReportingModel(
+                    hidden_dim=self.hidden_dim,
+                    num_st_blocks=self.num_st_blocks,
+                    window_size=self.window_size,
+                    epochs=self.epochs,
+                    learning_rate=self.learning_rate,
+                    dropout=self.dropout,
+                    normalize_data=self.normalize_data,
+                    verbose=False,
+                    k_neighbors=self.k_neighbors,
+                    device=self.device
+                )
+                
+                ensemble_model.fit(
+                    panel_data,
+                    self.assignment_df,
+                    self.pre_period_data['date'].max().strftime('%Y-%m-%d')
+                )
+                
+                if use_log_iroas:
+                    estimate = ensemble_model._calculate_log_iroas(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                else:
+                    estimate = ensemble_model._calculate_iroas_robust(
+                        panel_data, period_start, period_end, spend_floor
+                    )
+                
+                ensemble_estimates.append(estimate)
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"     BCa model {i+1} failed: {e}")
+                continue
+        
+        if len(ensemble_estimates) < 3:
+            if self.verbose:
+                print("   ⚠️ Insufficient estimates for BCa - falling back to standard percentile")
+            return self._ensemble_confidence_interval_sequential(
+                panel_data, period_start, period_end, confidence_level,
+                ensemble_size, use_log_iroas, spend_floor
+            )
+        
+        ensemble_estimates = np.array(ensemble_estimates)
+        n = len(ensemble_estimates)
+        
+        # Calculate bias correction
+        theta_hat = np.mean(ensemble_estimates)
+        
+        # Count estimates below observed statistic (bias correction)
+        below_count = np.sum(ensemble_estimates < theta_hat)
+        bias_correction = scipy.stats.norm.ppf(below_count / n) if n > 0 else 0
+        
+        # Calculate acceleration using jackknife
+        jackknife_estimates = []
+        for i in range(n):
+            leave_one_out = np.delete(ensemble_estimates, i)
+            if len(leave_one_out) > 0:
+                jackknife_estimates.append(np.mean(leave_one_out))
+        
+        if len(jackknife_estimates) > 1:
+            jack_mean = np.mean(jackknife_estimates)
+            numerator = np.sum((jack_mean - np.array(jackknife_estimates))**3)
+            denominator = 6 * (np.sum((jack_mean - np.array(jackknife_estimates))**2))**1.5
+            acceleration = numerator / denominator if denominator != 0 else 0
+        else:
+            acceleration = 0
+        
+        # Calculate BCa confidence interval
+        alpha = 1 - confidence_level
+        z_alpha_2 = scipy.stats.norm.ppf(alpha/2)
+        z_1_alpha_2 = scipy.stats.norm.ppf(1 - alpha/2)
+        
+        # Adjust quantiles for bias and acceleration
+        alpha_1 = scipy.stats.norm.cdf(bias_correction + (bias_correction + z_alpha_2)/(1 - acceleration * (bias_correction + z_alpha_2)))
+        alpha_2 = scipy.stats.norm.cdf(bias_correction + (bias_correction + z_1_alpha_2)/(1 - acceleration * (bias_correction + z_1_alpha_2)))
+        
+        # Ensure valid quantiles
+        alpha_1 = max(0.001, min(0.999, alpha_1))
+        alpha_2 = max(0.001, min(0.999, alpha_2))
+        
+        # Calculate final confidence interval
+        lower_bound = np.percentile(ensemble_estimates, alpha_1 * 100)
+        upper_bound = np.percentile(ensemble_estimates, alpha_2 * 100)
+        
+        if self.verbose:
+            print(f"   📏 BCa corrections: bias={bias_correction:.3f}, accel={acceleration:.3f}")
+            print(f"   📏 Adjusted quantiles: {alpha_1:.3f}, {alpha_2:.3f}")
+        
+        return (lower_bound, upper_bound)
     
     def _normalize_data(self, data_tensor: torch.Tensor) -> torch.Tensor:
         """

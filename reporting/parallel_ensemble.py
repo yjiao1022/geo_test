@@ -120,12 +120,15 @@ def _train_single_ensemble_model_worker(args: Tuple) -> Dict[str, Any]:
         model = STGCNReportingModel(**model_config)
         model.fit(panel_data, assignment_df, pre_period_end)
         
-        # Extract model state for serialization
+        # Extract model state for serialization (handle missing attributes gracefully)
         model_state = {
-            'model_state_dict': model.model.state_dict() if hasattr(model, 'model') else None,
-            'assignment_df': model.assignment_df,
-            'pre_period_data': model.pre_period_data,
-            'scaler': model.scaler,
+            'model_state_dict': model.model.state_dict() if hasattr(model, 'model') and model.model is not None else None,
+            'assignment_df': getattr(model, 'assignment_df', None),
+            'pre_period_data': getattr(model, 'pre_period_data', None),
+            'scaler': getattr(model, 'scaler', None),
+            'data_mean': getattr(model, 'data_mean', None),
+            'data_std': getattr(model, 'data_std', None),
+            'is_fitted': getattr(model, 'is_fitted', False),
             'config': model_config,
             'model_idx': model_idx,
             'success': True,
@@ -150,6 +153,9 @@ def _train_single_ensemble_model_worker(args: Tuple) -> Dict[str, Any]:
             'assignment_df': None,
             'pre_period_data': None,
             'scaler': None,
+            'data_mean': None,
+            'data_std': None,
+            'is_fitted': False,
             'config': model_config
         }
 
@@ -215,17 +221,29 @@ class ParallelEnsembleSTGCN:
         # Create new model instance
         model = STGCNReportingModel(**model_state['config'])
         
-        # Restore state
-        if model_state['model_state_dict'] is not None:
-            # We need to initialize the model first by creating the architecture
-            # This is a bit tricky since we need the model to have been fitted
-            model.assignment_df = model_state['assignment_df']
-            model.pre_period_data = model_state['pre_period_data']
-            model.scaler = model_state['scaler']
+        # Restore state safely (handle missing attributes)
+        if model_state.get('model_state_dict') is not None:
+            # Restore basic attributes
+            if model_state.get('assignment_df') is not None:
+                model.assignment_df = model_state['assignment_df']
+            if model_state.get('pre_period_data') is not None:
+                model.pre_period_data = model_state['pre_period_data']
+            
+            # Restore normalization attributes if they exist
+            if model_state.get('scaler') is not None:
+                model.scaler = model_state['scaler']
+            if model_state.get('data_mean') is not None:
+                model.data_mean = model_state['data_mean']
+            if model_state.get('data_std') is not None:
+                model.data_std = model_state['data_std']
             
             # Create model architecture (this requires some data to infer shapes)
             if hasattr(model, '_build_model_architecture'):
-                model._build_model_architecture()
+                try:
+                    model._build_model_architecture()
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Warning: Could not build model architecture: {e}")
             
             # Load the state dict
             if hasattr(model, 'model') and model.model is not None:
@@ -236,7 +254,7 @@ class ParallelEnsembleSTGCN:
                         print(f"Warning: Could not load model state dict: {e}")
             
             # Mark as fitted
-            model.is_fitted = True
+            model.is_fitted = model_state.get('is_fitted', True)
         
         return model
     
