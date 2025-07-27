@@ -1601,7 +1601,9 @@ class STGCNReportingModel(BaseModel):
         n_mc_samples: int = 100,
         use_log_iroas: bool = True,
         spend_floor: float = 1e-6,
-        ensemble_size: int = 5
+        ensemble_size: int = 5,
+        n_jobs: int = -1,
+        use_parallel: bool = True
     ) -> Tuple[float, float]:
         """
         Calculate confidence interval with improved variance estimation methods.
@@ -1623,6 +1625,8 @@ class STGCNReportingModel(BaseModel):
             use_log_iroas: Use log-iROAS to prevent ratio explosion
             spend_floor: Minimum spend to prevent division by zero
             ensemble_size: Number of models in ensemble (default: 5)
+            n_jobs: Number of parallel jobs for ensemble (-1 for auto-detection)
+            use_parallel: Whether to use parallel training for ensemble method
             
         Returns:
             Tuple of (lower_bound, upper_bound)
@@ -1638,7 +1642,7 @@ class STGCNReportingModel(BaseModel):
         if method == 'ensemble':
             return self._ensemble_confidence_interval(
                 panel_data, period_start, period_end, confidence_level,
-                ensemble_size, use_log_iroas, spend_floor
+                ensemble_size, use_log_iroas, spend_floor, n_jobs, use_parallel
             )
         elif method == 'mc_dropout':
             return self._mc_dropout_confidence_interval(
@@ -1665,16 +1669,131 @@ class STGCNReportingModel(BaseModel):
         confidence_level: float,
         ensemble_size: int,
         use_log_iroas: bool,
-        spend_floor: float
+        spend_floor: float,
+        n_jobs: int = -1,
+        use_parallel: bool = True
     ) -> Tuple[float, float]:
         """
         Ensemble confidence interval using K independently trained models.
         
         This is the gold-standard approach that solves the overconfidence problem
         by capturing model initialization and training variance.
+        
+        Can use either parallel or sequential training based on use_parallel flag.
+        """
+        # Import parallel ensemble here to avoid circular imports
+        try:
+            from .parallel_ensemble import ParallelEnsembleSTGCN
+            parallel_available = True
+        except ImportError:
+            parallel_available = False
+            if use_parallel and self.verbose:
+                print("⚠️ Parallel ensemble not available, falling back to sequential training")
+        
+        # Use parallel training if requested and available
+        if use_parallel and parallel_available and n_jobs != 1:
+            return self._ensemble_confidence_interval_parallel(
+                panel_data, period_start, period_end, confidence_level,
+                ensemble_size, use_log_iroas, spend_floor, n_jobs
+            )
+        else:
+            return self._ensemble_confidence_interval_sequential(
+                panel_data, period_start, period_end, confidence_level,
+                ensemble_size, use_log_iroas, spend_floor
+            )
+    
+    def _ensemble_confidence_interval_parallel(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        confidence_level: float,
+        ensemble_size: int,
+        use_log_iroas: bool,
+        spend_floor: float,
+        n_jobs: int
+    ) -> Tuple[float, float]:
+        """
+        Parallel ensemble confidence interval using multiprocessing.
+        """
+        from .parallel_ensemble import ParallelEnsembleSTGCN
+        
+        if self.verbose:
+            print(f"Training ensemble of {ensemble_size} models in parallel for CI estimation...")
+        
+        # Create model configuration
+        model_config = {
+            'hidden_dim': self.hidden_dim,
+            'num_st_blocks': self.num_st_blocks,
+            'window_size': self.window_size,
+            'epochs': self.epochs,
+            'learning_rate': self.learning_rate,
+            'dropout': self.dropout,
+            'normalize_data': self.normalize_data,
+            'verbose': False,  # Suppress individual model output
+            'k_neighbors': self.k_neighbors,
+            'device': self.device
+        }
+        
+        # Create parallel ensemble
+        parallel_ensemble = ParallelEnsembleSTGCN(
+            ensemble_size=ensemble_size,
+            n_jobs=n_jobs,
+            verbose=self.verbose
+        )
+        
+        # Set model config separately to avoid duplicate arguments
+        parallel_ensemble.model_config = model_config
+        
+        try:
+            # Fit ensemble in parallel
+            parallel_ensemble.fit_parallel(
+                panel_data,
+                self.assignment_df,
+                self.pre_period_data['date'].max().strftime('%Y-%m-%d'),
+                seed=5000
+            )
+            
+            # Calculate confidence interval
+            lower_bound, upper_bound = parallel_ensemble.confidence_interval(
+                panel_data, period_start, period_end, confidence_level,
+                use_log_iroas, spend_floor
+            )
+            
+            if self.verbose:
+                diagnostics = parallel_ensemble.get_training_diagnostics()
+                print(f"  Parallel ensemble results: {diagnostics['successful_models']} models")
+                print(f"  Training time: {diagnostics.get('training_time', 'N/A'):.1f}s")
+                print(f"  Speedup: {diagnostics.get('speedup_estimate', 'N/A'):.1f}x")
+                print(f"  CI: [{lower_bound:.4f}, {upper_bound:.4f}]")
+            
+            return (lower_bound, upper_bound)
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"⚠️ Parallel ensemble failed: {e}")
+                print("   Falling back to sequential training...")
+            
+            return self._ensemble_confidence_interval_sequential(
+                panel_data, period_start, period_end, confidence_level,
+                ensemble_size, use_log_iroas, spend_floor
+            )
+    
+    def _ensemble_confidence_interval_sequential(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str,
+        confidence_level: float,
+        ensemble_size: int,
+        use_log_iroas: bool,
+        spend_floor: float
+    ) -> Tuple[float, float]:
+        """
+        Sequential ensemble confidence interval (original implementation).
         """
         if self.verbose:
-            print(f"Training ensemble of {ensemble_size} models for CI estimation...")
+            print(f"Training ensemble of {ensemble_size} models sequentially for CI estimation...")
         
         ensemble_iroas = []
         successful_models = 0
@@ -1749,7 +1868,7 @@ class STGCNReportingModel(BaseModel):
         upper_bound = ensemble_mean + margin
         
         if self.verbose:
-            print(f"  Ensemble results: {successful_models} models, std={ensemble_std:.4f}")
+            print(f"  Sequential ensemble results: {successful_models} models, std={ensemble_std:.4f}")
             print(f"  CI: [{lower_bound:.4f}, {upper_bound:.4f}]")
         
         return (lower_bound, upper_bound)
