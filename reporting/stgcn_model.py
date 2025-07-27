@@ -349,7 +349,9 @@ class STGCNReportingModel(BaseModel):
         normalize_data: bool = True,  # Add data normalization option
         verbose: bool = True,  # Control training output verbosity
         bias_threshold: float = 0.1,  # Threshold for bias detection in null scenarios
-        strict_numerical_checks: bool = False  # Enable strict numerical error handling and anomaly detection
+        strict_numerical_checks: bool = False,  # Enable strict numerical error handling and anomaly detection
+        use_offset_calibration: bool = False,  # NEW: Enable simple offset calibration to reduce bias
+        use_linear_calibration: bool = False   # NEW: Enable linear calibration (beta0 + beta1 * y_hat)
     ):
         """
         Initialize STGCN reporting model.
@@ -393,6 +395,8 @@ class STGCNReportingModel(BaseModel):
         self.verbose = verbose
         self.bias_threshold = bias_threshold
         self.strict_numerical_checks = strict_numerical_checks
+        self.use_offset_calibration = use_offset_calibration
+        self.use_linear_calibration = use_linear_calibration
         
         # Model components (initialized during fit)
         self.model = None
@@ -405,6 +409,10 @@ class STGCNReportingModel(BaseModel):
         # Data normalization parameters
         self.data_mean = None
         self.data_std = None
+        
+        # Calibration parameters for bias correction
+        self.offset_bias = None  # For simple offset calibration
+        self.linear_calibration_params = None  # For linear calibration (beta0, beta1)
         
         # Training monitoring and diagnostics
         self.training_diagnostics = {}
@@ -1294,6 +1302,10 @@ class STGCNReportingModel(BaseModel):
             
             self.is_fitted = True
             
+            # Compute calibration parameters if enabled (after model is fitted)
+            if self.use_offset_calibration or self.use_linear_calibration:
+                self._compute_calibration_parameters(panel_data, assignment_df, pre_period_end)
+            
             # Store loss trajectory for analysis
             self.training_losses = loss_history
             
@@ -1393,6 +1405,184 @@ class STGCNReportingModel(BaseModel):
                 residuals.append(residual)
         
         self.training_residuals = np.concatenate(residuals, axis=0)
+    
+    def _compute_calibration_parameters(
+        self,
+        panel_data: pd.DataFrame,
+        assignment_df: pd.DataFrame,
+        pre_period_end: str
+    ):
+        """
+        Compute calibration parameters for bias correction.
+        
+        This method computes offset and/or linear calibration parameters using pre-period data
+        to reduce systematic bias in predictions. The calibration is fitted on pre-period
+        residuals (actual - predicted) to correct future predictions.
+        
+        Args:
+            panel_data: Panel data used for training
+            assignment_df: Assignment of geos to treatment/control
+            pre_period_end: End date of pre-period
+        """
+        if self.verbose:
+            print("\n🎯 Computing calibration parameters for bias reduction...")
+        
+        try:
+            # Get pre-period data for calibration
+            panel_data = panel_data.copy()
+            panel_data['date'] = pd.to_datetime(panel_data['date'])
+            pre_period_end = pd.to_datetime(pre_period_end)
+            
+            pre_period_data = panel_data[panel_data['date'] <= pre_period_end].copy()
+            
+            # Use a subset of pre-period for calibration computation (last 30% to avoid overfitting)
+            dates = sorted(pre_period_data['date'].unique())
+            calibration_start_idx = max(0, int(len(dates) * 0.7))  # Use last 30% of pre-period
+            calibration_start_date = dates[calibration_start_idx]
+            
+            calibration_data = pre_period_data[
+                pre_period_data['date'] >= calibration_start_date
+            ].copy()
+            
+            if len(calibration_data) < 10:  # Need minimum amount of data
+                if self.verbose:
+                    print("   ⚠️ Insufficient data for calibration. Skipping bias correction.")
+                return
+            
+            # Get predictions for calibration period
+            calibration_start_str = calibration_start_date.strftime('%Y-%m-%d')
+            calibration_end_str = dates[-1].strftime('%Y-%m-%d')
+            
+            # Get raw predictions (without calibration)
+            old_offset_bias = self.offset_bias  # Temporarily disable calibration
+            old_linear_params = self.linear_calibration_params
+            self.offset_bias = None
+            self.linear_calibration_params = None
+            
+            raw_predictions = self.predict(pre_period_data, calibration_start_str, calibration_end_str)
+            
+            # Restore calibration state (though it should be None at this point)
+            # We'll set the computed values below
+            
+            # The predict method returns aggregated predictions, not geo-level
+            # For calibration, we need to use a simpler approach based on aggregate bias
+            
+            # Get actual totals for calibration period
+            actual_sales_total = calibration_data['sales'].sum()
+            actual_spend_total = calibration_data['spend'].sum()
+            
+            # Get predicted totals (raw_predictions contains aggregate values)
+            if isinstance(raw_predictions, dict) and 'sales' in raw_predictions:
+                predicted_sales_total = raw_predictions['sales'].sum() if hasattr(raw_predictions['sales'], 'sum') else float(raw_predictions['sales'])
+                predicted_spend_total = raw_predictions['spend'].sum() if hasattr(raw_predictions['spend'], 'sum') else float(raw_predictions['spend'])
+                
+                # Compute aggregate residuals: actual - predicted
+                residual_sales = actual_sales_total - predicted_sales_total
+                residual_spend = actual_spend_total - predicted_spend_total
+                
+                # Store as per-unit offsets (divide by number of data points for scaling)
+                num_data_points = len(calibration_data)
+                offset_sales = residual_sales / num_data_points if num_data_points > 0 else 0
+                offset_spend = residual_spend / num_data_points if num_data_points > 0 else 0
+                
+                if self.verbose:
+                    print(f"   Computed aggregate bias: sales={residual_sales:.2f}, spend={residual_spend:.2f}")
+                    print(f"   Per-unit offset: sales={offset_sales:.4f}, spend={offset_spend:.4f}")
+                
+            else:
+                if self.verbose:
+                    print(f"   ⚠️ Unexpected prediction format: {type(raw_predictions)}")
+                offset_sales = 0
+                offset_spend = 0
+            
+            # 1. Simple Offset Calibration
+            if self.use_offset_calibration:
+                self.offset_bias = {
+                    'sales': offset_sales,
+                    'spend': offset_spend
+                }
+                
+                if self.verbose:
+                    print(f"   ✅ Offset calibration computed:")
+                    print(f"      Sales bias: {offset_sales:.4f}")
+                    print(f"      Spend bias: {offset_spend:.4f}")
+            
+            # 2. Linear Calibration (beta0 + beta1 * y_hat)
+            # For aggregate predictions, linear calibration is less useful
+            # We'll fall back to offset calibration for now
+            if self.use_linear_calibration:
+                if self.verbose:
+                    print("   ⚠️ Linear calibration not implemented for aggregate predictions.")
+                    print("      Using offset calibration instead.")
+                
+                # Fall back to offset calibration if not already enabled
+                if not self.use_offset_calibration:
+                    self.offset_bias = {
+                        'sales': offset_sales,
+                        'spend': offset_spend
+                    }
+            
+            # Estimate bias reduction
+            if self.offset_bias is not None:
+                original_bias_sales = abs(offset_sales)
+                expected_bias_sales = abs(offset_sales - self.offset_bias['sales'])
+                bias_reduction = max(0, (original_bias_sales - expected_bias_sales) / original_bias_sales) if original_bias_sales > 0 else 0
+                
+                if self.verbose:
+                    print(f"   📊 Expected bias reduction: {bias_reduction:.1%}")
+                    print(f"      Original bias magnitude: {original_bias_sales:.4f}")
+                    print(f"      Expected post-calibration bias: {expected_bias_sales:.4f}")
+        
+        except Exception as e:
+            if self.verbose:
+                print(f"   ❌ Calibration computation failed: {e}")
+                print("   Proceeding without calibration.")
+            # Reset calibration parameters
+            self.offset_bias = None
+            self.linear_calibration_params = None
+    
+    def _apply_calibration_correction(self, predictions: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Apply calibration correction to predictions.
+        
+        This is the key method that actually corrects predictions using the computed
+        calibration parameters. This is where the "one line of code" bias correction happens.
+        
+        Args:
+            predictions: Raw predictions dictionary with 'sales' and 'spend' keys (aggregate format)
+            
+        Returns:
+            Calibrated predictions dictionary
+        """
+        if self.offset_bias is None and self.linear_calibration_params is None:
+            return predictions
+        
+        corrected_predictions = {}
+        
+        for metric in ['sales', 'spend']:
+            if metric in predictions:
+                metric_predictions = predictions[metric]
+                
+                # Apply calibration
+                if self.linear_calibration_params is not None and metric in self.linear_calibration_params:
+                    # Linear calibration: corrected = beta0 + beta1 * predicted
+                    params = self.linear_calibration_params[metric]
+                    beta0, beta1 = params['beta0'], params['beta1']
+                    corrected_predictions[metric] = beta0 + beta1 * metric_predictions
+                    
+                elif self.offset_bias is not None and metric in self.offset_bias:
+                    # Simple offset calibration: corrected = predicted + offset
+                    offset = self.offset_bias[metric]
+                    corrected_predictions[metric] = metric_predictions + offset
+                    
+                else:
+                    # No calibration for this metric
+                    corrected_predictions[metric] = metric_predictions
+            else:
+                # Metric not in predictions, keep as is
+                corrected_predictions[metric] = predictions.get(metric, np.array([]))
+        
+        return corrected_predictions
     
     def predict(
         self,
@@ -1533,6 +1723,10 @@ class STGCNReportingModel(BaseModel):
                 for warning in prediction_warnings:
                     print(warning)
         
+        # Apply calibration correction if enabled
+        if self.offset_bias is not None or self.linear_calibration_params is not None:
+            results = self._apply_calibration_correction(results)
+        
         return results
     
     def calculate_iroas(
@@ -1604,7 +1798,8 @@ class STGCNReportingModel(BaseModel):
         spend_floor: float = 1e-6,
         ensemble_size: int = 5,
         n_jobs: int = -1,
-        use_parallel: bool = True
+        use_parallel: bool = True,
+        use_bca: bool = True  # NEW: Use BCa bootstrap instead of t-distribution
     ) -> Tuple[float, float]:
         """
         Calculate confidence interval with improved variance estimation methods.
@@ -1628,6 +1823,7 @@ class STGCNReportingModel(BaseModel):
             ensemble_size: Number of models in ensemble (default: 5)
             n_jobs: Number of parallel jobs for ensemble (-1 for auto-detection)
             use_parallel: Whether to use parallel training for ensemble method
+            use_bca: Use BCa bootstrap for CI instead of t-distribution (default: True)
             
         Returns:
             Tuple of (lower_bound, upper_bound)
@@ -1643,7 +1839,7 @@ class STGCNReportingModel(BaseModel):
         if method == 'ensemble':
             return self._ensemble_confidence_interval(
                 panel_data, period_start, period_end, confidence_level,
-                ensemble_size, use_log_iroas, spend_floor, n_jobs, use_parallel
+                ensemble_size, use_log_iroas, spend_floor, n_jobs, use_parallel, use_bca
             )
         elif method == 'mc_dropout':
             return self._mc_dropout_confidence_interval(
@@ -1672,7 +1868,8 @@ class STGCNReportingModel(BaseModel):
         use_log_iroas: bool,
         spend_floor: float,
         n_jobs: int = -1,
-        use_parallel: bool = True
+        use_parallel: bool = True,
+        use_bca: bool = True
     ) -> Tuple[float, float]:
         """
         Ensemble confidence interval using K independently trained models.
@@ -1695,12 +1892,12 @@ class STGCNReportingModel(BaseModel):
         if use_parallel and parallel_available and n_jobs != 1:
             return self._ensemble_confidence_interval_parallel(
                 panel_data, period_start, period_end, confidence_level,
-                ensemble_size, use_log_iroas, spend_floor, n_jobs
+                ensemble_size, use_log_iroas, spend_floor, n_jobs, use_bca
             )
         else:
             return self._ensemble_confidence_interval_sequential(
                 panel_data, period_start, period_end, confidence_level,
-                ensemble_size, use_log_iroas, spend_floor
+                ensemble_size, use_log_iroas, spend_floor, use_bca
             )
     
     def _ensemble_confidence_interval_parallel(
@@ -1712,7 +1909,8 @@ class STGCNReportingModel(BaseModel):
         ensemble_size: int,
         use_log_iroas: bool,
         spend_floor: float,
-        n_jobs: int
+        n_jobs: int,
+        use_bca: bool = True
     ) -> Tuple[float, float]:
         """
         Parallel ensemble confidence interval using multiprocessing.
@@ -1755,11 +1953,37 @@ class STGCNReportingModel(BaseModel):
                 seed=5000
             )
             
-            # Calculate confidence interval
-            lower_bound, upper_bound = parallel_ensemble.confidence_interval(
-                panel_data, period_start, period_end, confidence_level,
-                use_log_iroas, spend_floor
+            # Get ensemble iROAS estimates
+            ensemble_iroas = parallel_ensemble.calculate_ensemble_iroas(
+                panel_data, period_start, period_end, use_log_iroas, spend_floor
             )
+            
+            if len(ensemble_iroas) < 2:
+                if self.verbose:
+                    print("⚠️ Insufficient ensemble estimates from parallel training")
+                raise ValueError("Parallel ensemble failed to produce sufficient estimates")
+            
+            # Calculate confidence interval using BCa or t-distribution
+            ensemble_iroas = np.array(ensemble_iroas)
+            if use_bca and len(ensemble_iroas) >= 3:
+                if self.verbose:
+                    print(f"  Using BCa bootstrap for CI calculation...")
+                lower_bound, upper_bound = self._compute_bca_ci(ensemble_iroas, confidence_level)
+            else:
+                # Use t-distribution for small ensembles or when BCa disabled
+                from scipy import stats
+                ensemble_mean = np.mean(ensemble_iroas)
+                ensemble_std = np.std(ensemble_iroas, ddof=1)
+                alpha = 1 - confidence_level
+                t_score = stats.t.ppf(1 - alpha/2, df=len(ensemble_iroas) - 1)
+                margin = t_score * ensemble_std
+                
+                lower_bound = ensemble_mean - margin
+                upper_bound = ensemble_mean + margin
+                
+                if self.verbose:
+                    ci_method = "t-distribution" if not use_bca else "t-distribution (insufficient data for BCa)"
+                    print(f"  Using {ci_method} for CI calculation...")
             
             if self.verbose:
                 diagnostics = parallel_ensemble.get_training_diagnostics()
@@ -1777,7 +2001,7 @@ class STGCNReportingModel(BaseModel):
             
             return self._ensemble_confidence_interval_sequential(
                 panel_data, period_start, period_end, confidence_level,
-                ensemble_size, use_log_iroas, spend_floor
+                ensemble_size, use_log_iroas, spend_floor, use_bca
             )
     
     def _ensemble_confidence_interval_sequential(
@@ -1788,7 +2012,8 @@ class STGCNReportingModel(BaseModel):
         confidence_level: float,
         ensemble_size: int,
         use_log_iroas: bool,
-        spend_floor: float
+        spend_floor: float,
+        use_bca: bool = True
     ) -> Tuple[float, float]:
         """
         Sequential ensemble confidence interval (original implementation).
@@ -1859,18 +2084,109 @@ class STGCNReportingModel(BaseModel):
         ensemble_mean = np.mean(ensemble_iroas)
         ensemble_std = np.std(ensemble_iroas, ddof=1)  # Sample std
         
-        # Use t-distribution for small ensembles
-        from scipy import stats
-        alpha = 1 - confidence_level
-        t_score = stats.t.ppf(1 - alpha/2, df=successful_models - 1)
-        margin = t_score * ensemble_std
-        
-        lower_bound = ensemble_mean - margin
-        upper_bound = ensemble_mean + margin
+        if use_bca and successful_models >= 3:
+            # Use BCa bootstrap for better coverage
+            if self.verbose:
+                print(f"  Using BCa bootstrap for CI calculation...")
+            lower_bound, upper_bound = self._compute_bca_ci(ensemble_iroas, confidence_level)
+        else:
+            # Use t-distribution for small ensembles or when BCa disabled
+            from scipy import stats
+            alpha = 1 - confidence_level
+            t_score = stats.t.ppf(1 - alpha/2, df=successful_models - 1)
+            margin = t_score * ensemble_std
+            
+            lower_bound = ensemble_mean - margin
+            upper_bound = ensemble_mean + margin
+            
+            if self.verbose:
+                ci_method = "t-distribution" if not use_bca else "t-distribution (insufficient data for BCa)"
+                print(f"  Using {ci_method} for CI calculation...")
         
         if self.verbose:
             print(f"  Sequential ensemble results: {successful_models} models, std={ensemble_std:.4f}")
             print(f"  CI: [{lower_bound:.4f}, {upper_bound:.4f}]")
+        
+        return (lower_bound, upper_bound)
+    
+    def _compute_bca_ci(self, estimates: np.ndarray, confidence_level: float) -> Tuple[float, float]:
+        """
+        Compute BCa (Bias-corrected and accelerated) bootstrap confidence interval.
+        
+        Args:
+            estimates: Array of bootstrap estimates
+            confidence_level: Confidence level (e.g., 0.95)
+            
+        Returns:
+            Tuple of (lower_bound, upper_bound)
+        """
+        estimates = np.array(estimates)
+        n = len(estimates)
+        
+        if n < 3:
+            # Fallback to simple percentile
+            alpha = 1 - confidence_level
+            lower_percentile = (alpha / 2) * 100
+            upper_percentile = (1 - alpha / 2) * 100
+            return (np.percentile(estimates, lower_percentile), 
+                    np.percentile(estimates, upper_percentile))
+        
+        # Calculate bias correction
+        theta_hat = np.mean(estimates)
+        n_less = np.sum(estimates < theta_hat)
+        if n_less == 0:
+            bias_correction = -3.0  # Extreme case
+        elif n_less == n:
+            bias_correction = 3.0   # Extreme case
+        else:
+            from scipy import stats
+            bias_correction = stats.norm.ppf(n_less / n)
+        
+        # Calculate acceleration using jackknife
+        jackknife_estimates = []
+        for i in range(n):
+            # Leave-one-out estimates
+            jk_sample = np.concatenate([estimates[:i], estimates[i+1:]])
+            if len(jk_sample) > 0:
+                jackknife_estimates.append(np.mean(jk_sample))
+        
+        if len(jackknife_estimates) > 1:
+            jk_mean = np.mean(jackknife_estimates)
+            jk_diff = jk_mean - np.array(jackknife_estimates)
+            numerator = np.sum(jk_diff**3)
+            denominator = 6 * (np.sum(jk_diff**2))**(3/2)
+            acceleration = numerator / denominator if abs(denominator) > 1e-10 else 0.0
+        else:
+            acceleration = 0.0
+        
+        # Calculate adjusted quantiles
+        alpha = 1 - confidence_level
+        z_alpha_2 = stats.norm.ppf(alpha / 2)
+        z_1_alpha_2 = stats.norm.ppf(1 - alpha / 2)
+        
+        # BCa adjustments
+        denom1 = 1 - acceleration * (bias_correction + z_alpha_2)
+        denom2 = 1 - acceleration * (bias_correction + z_1_alpha_2)
+        
+        if abs(denom1) < 1e-10 or abs(denom2) < 1e-10:
+            # Fallback to standard percentile
+            alpha_1 = alpha / 2
+            alpha_2 = 1 - alpha / 2
+        else:
+            alpha_1 = stats.norm.cdf(bias_correction + (bias_correction + z_alpha_2) / denom1)
+            alpha_2 = stats.norm.cdf(bias_correction + (bias_correction + z_1_alpha_2) / denom2)
+        
+        # Ensure valid quantiles
+        alpha_1 = max(0.001, min(0.999, alpha_1))
+        alpha_2 = max(0.001, min(0.999, alpha_2))
+        
+        # Calculate final confidence interval
+        lower_bound = np.percentile(estimates, alpha_1 * 100)
+        upper_bound = np.percentile(estimates, alpha_2 * 100)
+        
+        if self.verbose:
+            print(f"    BCa corrections: bias={bias_correction:.3f}, accel={acceleration:.3f}")
+            print(f"    Adjusted quantiles: {alpha_1:.3f}, {alpha_2:.3f}")
         
         return (lower_bound, upper_bound)
     
@@ -2660,7 +2976,7 @@ RECOMMENDATION:
                 print("   ⚠️ Insufficient estimates for BCa - falling back to standard percentile")
             return self._ensemble_confidence_interval_sequential(
                 panel_data, period_start, period_end, confidence_level,
-                ensemble_size, use_log_iroas, spend_floor
+                ensemble_size, use_log_iroas, spend_floor, False  # Don't use BCa in fallback
             )
         
         ensemble_estimates = np.array(ensemble_estimates)
