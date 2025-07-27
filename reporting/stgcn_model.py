@@ -1415,9 +1415,8 @@ class STGCNReportingModel(BaseModel):
         """
         Compute calibration parameters for bias correction.
         
-        This method computes offset and/or linear calibration parameters using pre-period data
-        to reduce systematic bias in predictions. The calibration is fitted on pre-period
-        residuals (actual - predicted) to correct future predictions.
+        Simple approach: Disable calibration for now to fix the fundamental logic error.
+        The current implementation creates circular dependencies during training.
         
         Args:
             panel_data: Panel data used for training
@@ -1427,119 +1426,17 @@ class STGCNReportingModel(BaseModel):
         if self.verbose:
             print("\n🎯 Computing calibration parameters for bias reduction...")
         
-        try:
-            # Get pre-period data for calibration
-            panel_data = panel_data.copy()
-            panel_data['date'] = pd.to_datetime(panel_data['date'])
-            pre_period_end = pd.to_datetime(pre_period_end)
-            
-            pre_period_data = panel_data[panel_data['date'] <= pre_period_end].copy()
-            
-            # Use a subset of pre-period for calibration computation (last 30% to avoid overfitting)
-            dates = sorted(pre_period_data['date'].unique())
-            calibration_start_idx = max(0, int(len(dates) * 0.7))  # Use last 30% of pre-period
-            calibration_start_date = dates[calibration_start_idx]
-            
-            calibration_data = pre_period_data[
-                pre_period_data['date'] >= calibration_start_date
-            ].copy()
-            
-            if len(calibration_data) < 10:  # Need minimum amount of data
-                if self.verbose:
-                    print("   ⚠️ Insufficient data for calibration. Skipping bias correction.")
-                return
-            
-            # Get predictions for calibration period
-            calibration_start_str = calibration_start_date.strftime('%Y-%m-%d')
-            calibration_end_str = dates[-1].strftime('%Y-%m-%d')
-            
-            # Get raw predictions (without calibration)
-            old_offset_bias = self.offset_bias  # Temporarily disable calibration
-            old_linear_params = self.linear_calibration_params
-            self.offset_bias = None
-            self.linear_calibration_params = None
-            
-            raw_predictions = self.predict(pre_period_data, calibration_start_str, calibration_end_str)
-            
-            # Restore calibration state (though it should be None at this point)
-            # We'll set the computed values below
-            
-            # The predict method returns aggregated predictions, not geo-level
-            # For calibration, we need to use a simpler approach based on aggregate bias
-            
-            # Get actual totals for calibration period
-            actual_sales_total = calibration_data['sales'].sum()
-            actual_spend_total = calibration_data['spend'].sum()
-            
-            # Get predicted totals (raw_predictions contains aggregate values)
-            if isinstance(raw_predictions, dict) and 'sales' in raw_predictions:
-                predicted_sales_total = raw_predictions['sales'].sum() if hasattr(raw_predictions['sales'], 'sum') else float(raw_predictions['sales'])
-                predicted_spend_total = raw_predictions['spend'].sum() if hasattr(raw_predictions['spend'], 'sum') else float(raw_predictions['spend'])
-                
-                # Compute aggregate residuals: actual - predicted
-                residual_sales = actual_sales_total - predicted_sales_total
-                residual_spend = actual_spend_total - predicted_spend_total
-                
-                # Store as per-unit offsets (divide by number of data points for scaling)
-                num_data_points = len(calibration_data)
-                offset_sales = residual_sales / num_data_points if num_data_points > 0 else 0
-                offset_spend = residual_spend / num_data_points if num_data_points > 0 else 0
-                
-                if self.verbose:
-                    print(f"   Computed aggregate bias: sales={residual_sales:.2f}, spend={residual_spend:.2f}")
-                    print(f"   Per-unit offset: sales={offset_sales:.4f}, spend={offset_spend:.4f}")
-                
-            else:
-                if self.verbose:
-                    print(f"   ⚠️ Unexpected prediction format: {type(raw_predictions)}")
-                offset_sales = 0
-                offset_spend = 0
-            
-            # 1. Simple Offset Calibration
-            if self.use_offset_calibration:
-                self.offset_bias = {
-                    'sales': offset_sales,
-                    'spend': offset_spend
-                }
-                
-                if self.verbose:
-                    print(f"   ✅ Offset calibration computed:")
-                    print(f"      Sales bias: {offset_sales:.4f}")
-                    print(f"      Spend bias: {offset_spend:.4f}")
-            
-            # 2. Linear Calibration (beta0 + beta1 * y_hat)
-            # For aggregate predictions, linear calibration is less useful
-            # We'll fall back to offset calibration for now
-            if self.use_linear_calibration:
-                if self.verbose:
-                    print("   ⚠️ Linear calibration not implemented for aggregate predictions.")
-                    print("      Using offset calibration instead.")
-                
-                # Fall back to offset calibration if not already enabled
-                if not self.use_offset_calibration:
-                    self.offset_bias = {
-                        'sales': offset_sales,
-                        'spend': offset_spend
-                    }
-            
-            # Estimate bias reduction
-            if self.offset_bias is not None:
-                original_bias_sales = abs(offset_sales)
-                expected_bias_sales = abs(offset_sales - self.offset_bias['sales'])
-                bias_reduction = max(0, (original_bias_sales - expected_bias_sales) / original_bias_sales) if original_bias_sales > 0 else 0
-                
-                if self.verbose:
-                    print(f"   📊 Expected bias reduction: {bias_reduction:.1%}")
-                    print(f"      Original bias magnitude: {original_bias_sales:.4f}")
-                    print(f"      Expected post-calibration bias: {expected_bias_sales:.4f}")
+        # TEMPORARY FIX: Disable calibration to fix the circular dependency issue
+        # The current logic tries to predict during training which causes instability
         
-        except Exception as e:
+        if self.use_offset_calibration or self.use_linear_calibration:
             if self.verbose:
-                print(f"   ❌ Calibration computation failed: {e}")
-                print("   Proceeding without calibration.")
-            # Reset calibration parameters
-            self.offset_bias = None
-            self.linear_calibration_params = None
+                print("   ⚠️ Calibration temporarily disabled due to implementation issues.")
+                print("   ℹ️ Models will run without bias correction for now.")
+        
+        # Reset calibration parameters
+        self.offset_bias = None
+        self.linear_calibration_params = None
     
     def _apply_calibration_correction(self, predictions: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
@@ -2029,7 +1926,7 @@ class STGCNReportingModel(BaseModel):
             torch.manual_seed(5000 + i)
             np.random.seed(5000 + i)
             
-            # Create model with same configuration
+            # Create model with same configuration (including calibration settings)
             ensemble_model = STGCNReportingModel(
                 hidden_dim=self.hidden_dim,
                 num_st_blocks=self.num_st_blocks,
@@ -2040,7 +1937,9 @@ class STGCNReportingModel(BaseModel):
                 normalize_data=self.normalize_data,
                 verbose=False,  # Suppress individual model output
                 k_neighbors=self.k_neighbors,
-                device=self.device
+                device=self.device,
+                use_offset_calibration=self.use_offset_calibration,  # FIX: Include calibration
+                use_linear_calibration=self.use_linear_calibration   # FIX: Include calibration
             )
             
             try:
@@ -2547,7 +2446,7 @@ class STGCNReportingModel(BaseModel):
             np.random.seed(6000 + i)
             
             try:
-                # Create ensemble model
+                # Create ensemble model (with calibration settings)
                 ensemble_model = STGCNReportingModel(
                     hidden_dim=self.hidden_dim,
                     num_st_blocks=self.num_st_blocks,
@@ -2558,7 +2457,9 @@ class STGCNReportingModel(BaseModel):
                     normalize_data=self.normalize_data,
                     verbose=False,
                     k_neighbors=self.k_neighbors,
-                    device=self.device
+                    device=self.device,
+                    use_offset_calibration=self.use_offset_calibration,  # FIX: Include calibration
+                    use_linear_calibration=self.use_linear_calibration   # FIX: Include calibration
                 )
                 
                 # Fit model
@@ -2946,7 +2847,9 @@ RECOMMENDATION:
                     normalize_data=self.normalize_data,
                     verbose=False,
                     k_neighbors=self.k_neighbors,
-                    device=self.device
+                    device=self.device,
+                    use_offset_calibration=self.use_offset_calibration,  # FIX: Include calibration
+                    use_linear_calibration=self.use_linear_calibration   # FIX: Include calibration
                 )
                 
                 ensemble_model.fit(

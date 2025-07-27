@@ -279,6 +279,12 @@ class ParallelEnsembleSTGCN:
         """
         start_time = time.time()
         
+        # Store original data for model reconstruction in ensemble iROAS calculation
+        self.original_panel_data = panel_data.copy()
+        self.original_assignment_df = assignment_df.copy() 
+        self.original_pre_period_end = pre_period_end
+        self.base_seed = seed
+        
         if self.verbose:
             print(f"\n🔄 Training ensemble of {self.ensemble_size} models in parallel...")
             print(f"   Using {self.n_jobs} parallel processes")
@@ -463,25 +469,69 @@ class ParallelEnsembleSTGCN:
             try:
                 if isinstance(model, dict):
                     # Handle model proxy case (from parallel training)
-                    # Since full model reconstruction is complex, we'll re-train a model with the same seed
-                    # This is a pragmatic solution that preserves the ensemble variance
-                    torch.manual_seed(5000 + model_idx)
-                    np.random.seed(5000 + model_idx)
-                    
-                    # For simplicity in ensemble calculation, use a simplified approach
-                    # that approximates the ensemble variance without full model reconstruction
-                    # This provides the benefit of parallel training with acceptable accuracy
-                    
-                    # Use seed-based variance to simulate model differences
-                    torch.manual_seed(5000 + model_idx)
-                    np.random.seed(5000 + model_idx)
-                    
-                    # Create a base iROAS estimate with model-specific noise
-                    base_iroas = np.random.normal(0, 0.05)  # Simulate ensemble variance
-                    
-                    # Add some deterministic variation based on model index
-                    model_variation = (model_idx - len(self.ensemble_models)/2) * 0.02
-                    iroas = base_iroas + model_variation
+                    # Reconstruct model for proper iROAS calculation
+                    try:
+                        # Set the same seed used during training for reproducibility
+                        base_seed = getattr(self, 'base_seed', 5000)
+                        torch.manual_seed(base_seed + model_idx)
+                        np.random.seed(base_seed + model_idx)
+                        
+                        # Create a new model with same config
+                        config = model['config'].copy()
+                        ensemble_model = STGCNReportingModel(**config)
+                        
+                        # Restore critical model state
+                        ensemble_model.assignment_df = model['assignment_df']
+                        ensemble_model.pre_period_data = model['pre_period_data']
+                        if model['scaler'] is not None:
+                            ensemble_model.scaler = model['scaler']
+                        ensemble_model.data_mean = model.get('data_mean')
+                        ensemble_model.data_std = model.get('data_std')
+                        ensemble_model.is_fitted = True
+                        
+                        # Retrain the model (since we can't easily restore PyTorch model state across processes)
+                        # Get the pre_period_end from the original fitting data
+                        if hasattr(self, 'original_pre_period_end'):
+                            pre_period_end = self.original_pre_period_end
+                        else:
+                            # Fallback: use last date of pre_period_data as approximation
+                            if ensemble_model.pre_period_data is not None:
+                                pre_period_dates = ensemble_model.pre_period_data['date'].unique()
+                                pre_period_end = pd.to_datetime(pre_period_dates).max().strftime('%Y-%m-%d')
+                            else:
+                                raise ValueError("Cannot determine pre_period_end for ensemble model reconstruction")
+                        
+                        # Refit the model with the same seed (this should produce identical results)
+                        ensemble_model.fit(self.original_panel_data, model['assignment_df'], pre_period_end)
+                        
+                        # Calculate iROAS using the reconstructed model
+                        if use_log_iroas:
+                            iroas = ensemble_model._calculate_log_iroas(panel_data, period_start, period_end, spend_floor)
+                        else:
+                            iroas = ensemble_model._calculate_iroas_robust(panel_data, period_start, period_end, spend_floor)
+                            
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Warning: Model {model_idx} reconstruction failed: {e}")
+                            print(f"         Falling back to sequential ensemble method")
+                        
+                        # Fallback: use sequential ensemble approach for this model
+                        torch.manual_seed(base_seed + model_idx)
+                        np.random.seed(base_seed + model_idx)
+                        
+                        config = model['config'].copy()
+                        fallback_model = STGCNReportingModel(**config)
+                        
+                        # Refit from scratch (this will work but be slower)
+                        if hasattr(self, 'original_pre_period_end'):
+                            fallback_model.fit(self.original_panel_data, model['assignment_df'], self.original_pre_period_end)
+                            if use_log_iroas:
+                                iroas = fallback_model._calculate_log_iroas(panel_data, period_start, period_end, spend_floor)
+                            else:
+                                iroas = fallback_model._calculate_iroas_robust(panel_data, period_start, period_end, spend_floor)
+                        else:
+                            # Ultimate fallback: skip this model
+                            continue
                 else:
                     # Full model case (from sequential training)
                     if use_log_iroas:

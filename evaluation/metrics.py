@@ -169,6 +169,9 @@ class EvaluationRunner:
         ci_width = iroas_upper - iroas_lower
         half_ci_width = ci_width / 2.0
         significant = (iroas_lower > 0) or (iroas_upper < 0)
+
+        if "STGCN" in report_name:
+            print(f"[Debug Significance] SimID: {sim_id}, Model: {report_name}, Lower: {iroas_lower:.4f}, Upper: {iroas_upper:.4f}, Significant: {significant}")
         
         return EvaluationResult(
             simulation_id=sim_id,
