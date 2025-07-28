@@ -1587,10 +1587,18 @@ class STGCNReportingModel(BaseModel):
         ].cpu().numpy()
         
         # Convert back to original format
+        # CRITICAL: This aggregation ensures consistency with traditional methods for A/A testing
         results = {}
         for i, feature in enumerate(self.feature_cols):
-            # Average across treatment geos and sum across time
-            feature_counterfactual = counterfactual_data[:, :, i].sum(axis=1)  # Sum over time
+            # MODIFIED FOR CONSISTENCY: Average across treatment geos to get daily predictions
+            # Original: counterfactual_data[:, :, i].sum(axis=1)  # Sum over time → geo-level totals
+            # Fixed:    counterfactual_data[:, :, i].mean(axis=0) # Mean over geos → daily predictions
+            # 
+            # This change ensures STGCN returns the same prediction format as traditional methods:
+            # - Shape: (n_evaluation_days,) instead of (n_treatment_geos,)
+            # - Values: Daily average predictions instead of geo-level totals
+            # - Aggregation: Matches daily mean approach used by MeanMatching, TBR, SCM
+            feature_counterfactual = counterfactual_data[:, :, i].mean(axis=0)  # Mean over geos, keep time dimension
             results[feature] = feature_counterfactual
         
         # Validate predictions and provide warnings
