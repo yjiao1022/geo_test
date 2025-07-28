@@ -175,36 +175,79 @@ class EvaluationRunner:
         
         # Calculate metrics based on mode
         if self.config.aa_mode:
-            # A/A mode: track component metrics separately
-            incremental_sales, incremental_spend = self._calculate_component_metrics(
-                report_method, panel_data, assignment_df, eval_period_start, eval_period_end
-            )
+            # A/A mode: Use different approaches for STGCN vs baseline methods
             
-            # Calculate component confidence intervals
-            from reporting.conformal_utils import calculate_component_confidence_intervals
-            
-            component_cis = calculate_component_confidence_intervals(
-                report_method, panel_data, assignment_df, pre_period_end,
-                eval_period_start, eval_period_end, 
-                confidence_level=self.config.confidence_level,
-                uncertainty_method=self.config.uncertainty_method
-            )
-            
-            sales_lower, sales_upper = component_cis['sales']
-            spend_lower, spend_upper = component_cis['spend']
-            
-            # Significance based on components
-            sales_significant = (sales_lower > 0) or (sales_upper < 0)
-            spend_significant = (spend_lower > 0) or (spend_upper < 0)
-            significant = sales_significant  # Use sales significance for overall
-            
-            # Legacy iROAS for compatibility (but avoid division by zero)
-            if abs(incremental_spend) > 1e-6:
-                iroas_estimate = incremental_sales / incremental_spend
+            if "STGCN" in report_name:
+                # STGCN: Use component metrics with bias correction and conformal CI
+                incremental_sales, incremental_spend = self._calculate_component_metrics(
+                    report_method, panel_data, assignment_df, eval_period_start, eval_period_end
+                )
+                
+                if self.config.uncertainty_method == 'conformal':
+                    # Use conformal prediction for STGCN models
+                    from reporting.conformal_utils import calculate_component_confidence_intervals
+                    
+                    component_cis = calculate_component_confidence_intervals(
+                        report_method, panel_data, assignment_df, pre_period_end,
+                        eval_period_start, eval_period_end, 
+                        confidence_level=self.config.confidence_level,
+                        uncertainty_method=self.config.uncertainty_method
+                    )
+                    
+                    sales_lower, sales_upper = component_cis['sales']
+                    spend_lower, spend_upper = component_cis['spend']
+                else:
+                    # Fallback to bootstrap for STGCN if not conformal
+                    sales_lower, sales_upper = self._bootstrap_incremental_sales_ci(
+                        report_method, panel_data, assignment_df, eval_period_start, eval_period_end,
+                        confidence_level=self.config.confidence_level,
+                        n_bootstrap=self.config.n_bootstrap,
+                        seed=sim_id
+                    )
+                    spend_lower, spend_upper = 0.0, 0.0
+                
+                # Significance based on components
+                sales_significant = (sales_lower > 0) or (sales_upper < 0)
+                spend_significant = (spend_lower > 0) or (spend_upper < 0)
+                significant = sales_significant
+                
+                # Legacy iROAS for compatibility
+                if abs(incremental_spend) > 1e-6:
+                    iroas_estimate = incremental_sales / incremental_spend
+                else:
+                    iroas_estimate = 0.0
+                
+                iroas_lower, iroas_upper = sales_lower, sales_upper
+                
             else:
-                iroas_estimate = 0.0
-            
-            iroas_lower, iroas_upper = sales_lower, sales_upper  # Use sales CI as proxy
+                # Baseline methods: Use original iROAS calculation (like commit baafb1f)
+                # This preserves the working behavior for Mean Matching, TBR, SCM
+                iroas_estimate = report_method.calculate_iroas(
+                    panel_data, eval_period_start, eval_period_end
+                )
+                
+                iroas_lower, iroas_upper = report_method.confidence_interval(
+                    panel_data, eval_period_start, eval_period_end,
+                    confidence_level=self.config.confidence_level,
+                    n_bootstrap=self.config.n_bootstrap,
+                    seed=sim_id
+                )
+                
+                # For A/A mode compatibility, set component metrics to zero-equivalent
+                # Since iROAS ≈ incremental_sales / incremental_spend, and in A/A incremental_spend ≈ 0,
+                # we approximate incremental_sales ≈ iROAS * typical_spend_level
+                typical_spend = 1.0  # Normalized to make incremental_sales ≈ iROAS 
+                incremental_sales = iroas_estimate * typical_spend
+                incremental_spend = 0.0  # A/A mode assumption
+                
+                sales_lower = iroas_lower * typical_spend
+                sales_upper = iroas_upper * typical_spend
+                spend_lower, spend_upper = 0.0, 0.0
+                
+                # Significance based on original iROAS CI
+                sales_significant = (iroas_lower > 0) or (iroas_upper < 0)
+                spend_significant = False
+                significant = sales_significant
             
         else:
             # Traditional iROAS mode
@@ -315,6 +358,90 @@ class EvaluationRunner:
         except Exception as e:
             # Fallback to zero if calculation fails
             return (0.0, 0.0)
+    
+    def _bootstrap_incremental_sales_ci(
+        self,
+        model: BaseModel,
+        panel_data: pd.DataFrame,
+        assignment_df: pd.DataFrame,
+        eval_period_start: str,
+        eval_period_end: str,
+        confidence_level: float = 0.95,
+        n_bootstrap: int = 500,
+        seed: Optional[int] = None
+    ) -> Tuple[float, float]:
+        """
+        Bootstrap confidence interval for incremental sales using baseline methods.
+        
+        This recreates the proper bootstrap CI calculation that was working 
+        in the previous version (commit baafb1f) for baseline methods.
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        
+        bootstrap_sales = []
+        
+        # Get treatment and control geos
+        treatment_geos = assignment_df[assignment_df['assignment'] == 'treatment']['geo'].values
+        control_geos = assignment_df[assignment_df['assignment'] == 'control']['geo'].values
+        
+        # Get evaluation period data
+        panel_data_copy = panel_data.copy()
+        panel_data_copy['date'] = pd.to_datetime(panel_data_copy['date'])
+        eval_start_dt = pd.to_datetime(eval_period_start)
+        eval_end_dt = pd.to_datetime(eval_period_end)
+        
+        eval_data = panel_data_copy[
+            (panel_data_copy['date'] >= eval_start_dt) & 
+            (panel_data_copy['date'] <= eval_end_dt)
+        ]
+        
+        for _ in range(n_bootstrap):
+            # Bootstrap sample control geos (this is the key for proper variance estimation)
+            bootstrap_control_geos = np.random.choice(
+                control_geos, 
+                size=len(control_geos), 
+                replace=True
+            )
+            
+            # Create bootstrap assignment
+            bootstrap_assignment = assignment_df.copy()
+            bootstrap_assignment.loc[
+                bootstrap_assignment['assignment'] == 'control', 'geo'
+            ] = bootstrap_control_geos
+            
+            try:
+                # Refit model with bootstrap sample
+                # Use the original pre_period_end (need to get it from the calling context)
+                pre_period_end_dt = eval_start_dt - pd.Timedelta(days=1)
+                pre_period_end_str = pre_period_end_dt.strftime('%Y-%m-%d')
+                
+                model.fit(panel_data, bootstrap_assignment, pre_period_end_str)
+                
+                # Calculate incremental sales for this bootstrap sample
+                bootstrap_incremental_sales, _ = self._calculate_component_metrics(
+                    model, panel_data, bootstrap_assignment, eval_period_start, eval_period_end
+                )
+                
+                bootstrap_sales.append(bootstrap_incremental_sales)
+                
+            except Exception:
+                # Skip failed bootstrap samples
+                continue
+        
+        if len(bootstrap_sales) < 10:  # Not enough successful bootstrap samples
+            return 0.0, 0.0
+        
+        # Calculate confidence interval
+        alpha = 1 - confidence_level
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        
+        bootstrap_sales = np.array(bootstrap_sales)
+        lower_bound = np.percentile(bootstrap_sales, lower_percentile)
+        upper_bound = np.percentile(bootstrap_sales, upper_percentile)
+        
+        return lower_bound, upper_bound
     
     def summarize_results(self, results_df: pd.DataFrame) -> pd.DataFrame:
         """

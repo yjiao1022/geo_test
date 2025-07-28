@@ -78,37 +78,65 @@ def split_conformal_interval(
         # Calculate actual vs predicted residuals for control group
         calib_scores = []
         
-        # Get actual control group sales during calibration period
+        # Strategy 1: Try to get aggregate actual vs predicted
         actual_control_sales = calib_control_data.groupby('date')['sales'].sum()
         
-        # Handle different prediction formats
         if isinstance(calib_predictions.get('sales'), np.ndarray):
             pred_sales = calib_predictions['sales']
             if len(pred_sales) == len(actual_control_sales):
                 residuals = np.abs(actual_control_sales.values - pred_sales)
                 calib_scores.extend(residuals)
         
-        # Fallback to simpler approach if prediction format doesn't match
+        # Strategy 2: If aggregate doesn't work, get per-geo residuals
         if len(calib_scores) == 0:
             for geo in control_geos:
                 geo_calib_data = calib_control_data[calib_control_data['geo'] == geo]
                 if len(geo_calib_data) > 0:
-                    # Use sales variability as nonconformity score
+                    # Try to get model prediction for this specific geo and period
+                    geo_panel = panel_data[panel_data['geo'] == geo]
+                    try:
+                        geo_pred = model.predict(geo_panel, calib_start_str, calib_end_str)
+                        if isinstance(geo_pred.get('sales'), (np.ndarray, float, int)):
+                            actual_geo_sales = geo_calib_data['sales'].sum()
+                            pred_geo_sales = np.sum(geo_pred['sales']) if isinstance(geo_pred['sales'], np.ndarray) else geo_pred['sales']
+                            calib_scores.append(abs(actual_geo_sales - pred_geo_sales))
+                        else:
+                            # If model prediction fails for this geo, use temporal residuals
+                            sales_values = geo_calib_data['sales'].values
+                            # Use residuals from linear trend instead of mean (more realistic)
+                            x = np.arange(len(sales_values))
+                            if len(x) > 1:
+                                slope = np.polyfit(x, sales_values, 1)[0]
+                                trend = slope * x + sales_values[0]
+                                residuals = np.abs(sales_values - trend)
+                            else:
+                                residuals = np.abs(sales_values - sales_values.mean())
+                            calib_scores.extend(residuals)
+                    except:
+                        # Final fallback: use daily deviations from geo mean
+                        sales_values = geo_calib_data['sales'].values
+                        mean_sales = sales_values.mean()
+                        scores = np.abs(sales_values - mean_sales)
+                        calib_scores.extend(scores)
+        
+    except Exception:
+        # Complete fallback: use temporal variation across all control geos
+        calib_scores = []
+        # Use day-to-day variation instead of within-geo variation
+        daily_totals = calib_control_data.groupby('date')['sales'].sum()
+        if len(daily_totals) > 1:
+            # Use consecutive day differences
+            daily_diffs = np.abs(np.diff(daily_totals.values))
+            calib_scores.extend(daily_diffs)
+        else:
+            # Ultimate fallback
+            for geo in control_geos:
+                geo_calib_data = calib_control_data[calib_control_data['geo'] == geo]
+                if len(geo_calib_data) > 0:
                     sales_values = geo_calib_data['sales'].values
                     mean_sales = sales_values.mean()
                     scores = np.abs(sales_values - mean_sales)
                     calib_scores.extend(scores)
-        
-    except Exception:
-        # Fallback to simple variability if model prediction fails
-        calib_scores = []
-        for geo in control_geos:
-            geo_calib_data = calib_control_data[calib_control_data['geo'] == geo]
-            if len(geo_calib_data) > 0:
-                sales_values = geo_calib_data['sales'].values
-                mean_sales = sales_values.mean()
-                scores = np.abs(sales_values - mean_sales)
-                calib_scores.extend(scores)
     
     if len(calib_scores) == 0:
         return (0.0, 0.0)

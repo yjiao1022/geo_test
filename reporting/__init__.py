@@ -7,5 +7,7 @@ and computing treatment effects in geo-experiments.
 
 from .models import MeanMatchingModel, GBRModel, TBRModel, SyntheticControlModel
 from .stgcn_model import STGCNReportingModel
+from .stgcn_shallow import STGCNShallowModel, STGCNIntermediateModel
 
-__all__ = ['MeanMatchingModel', 'GBRModel', 'TBRModel', 'SyntheticControlModel', 'STGCNReportingModel']
+__all__ = ['MeanMatchingModel', 'GBRModel', 'TBRModel', 'SyntheticControlModel', 
+           'STGCNReportingModel', 'STGCNShallowModel', 'STGCNIntermediateModel']
