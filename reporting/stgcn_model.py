@@ -44,6 +44,7 @@ except ImportError:
             raise ImportError("PyTorch Geometric not available")
 
 from .models import BaseModel
+from .common_utils import ReportingConfig, apply_observed_spend_override
 from assignment.spatial_utils import build_spatial_adjacency_matrix, prepare_stgcn_data
 
 
@@ -351,7 +352,8 @@ class STGCNReportingModel(BaseModel):
         bias_threshold: float = 0.1,  # Threshold for bias detection in null scenarios
         strict_numerical_checks: bool = False,  # Enable strict numerical error handling and anomaly detection
         use_offset_calibration: bool = False,  # NEW: Enable simple offset calibration to reduce bias
-        use_linear_calibration: bool = False   # NEW: Enable linear calibration (beta0 + beta1 * y_hat)
+        use_linear_calibration: bool = False,  # NEW: Enable linear calibration (beta0 + beta1 * y_hat)
+        reporting_config: Optional[ReportingConfig] = None  # NEW: Diagnostic configuration
     ):
         """
         Initialize STGCN reporting model.
@@ -397,6 +399,7 @@ class STGCNReportingModel(BaseModel):
         self.strict_numerical_checks = strict_numerical_checks
         self.use_offset_calibration = use_offset_calibration
         self.use_linear_calibration = use_linear_calibration
+        self.reporting_config = reporting_config or ReportingConfig()
         
         # Model components (initialized during fit)
         self.model = None
@@ -1078,6 +1081,9 @@ class STGCNReportingModel(BaseModel):
             # Store data for later use
             self.assignment_df = assignment_df.copy()
             
+            # Store pre_period_end for bias correction
+            self.model_params['pre_period_end'] = pre_period_end
+            
             # Filter to pre-period data
             panel_data['date'] = pd.to_datetime(panel_data['date'])
             pre_period_end = pd.to_datetime(pre_period_end)
@@ -1335,6 +1341,9 @@ class STGCNReportingModel(BaseModel):
             # Perform null scenario bias detection
             self._detect_null_bias()
             
+            # Calculate daily per-geo bias offset at end of training
+            self.daily_geo_bias = self._calculate_bias_offset(panel_data, assignment_df, pre_period_end)
+            
             return self
             
         except Exception as e:
@@ -1438,6 +1447,159 @@ class STGCNReportingModel(BaseModel):
         self.offset_bias = None
         self.linear_calibration_params = None
     
+    def _calculate_bias_offset(
+        self, 
+        panel_data: pd.DataFrame,
+        assignment_df: pd.DataFrame,
+        pre_period_end: str
+    ) -> float:
+        """
+        Calculate per-geo-per-day bias offset using control geos in pre-period only.
+        
+        Returns offset_per_day_per_geo = 
+            (sum_control_pre_actual – sum_control_pre_predicted)
+            / (#-of-control-geos × #-of-days-in-sample)
+        
+        Args:
+            panel_data: Full panel data
+            assignment_df: Assignment of geos to treatment/control
+            pre_period_end: End date of pre-period
+            
+        Returns:
+            Per-geo-per-day bias offset in dollars per geo per day
+        """
+        try:
+            # Get control geos only
+            control_geos = assignment_df[
+                assignment_df['assignment'] == 'control'
+            ]['geo'].values
+            
+            if len(control_geos) == 0:
+                return 0.0
+            
+            # Get pre-period data for control geos only
+            panel_data_copy = panel_data.copy()
+            panel_data_copy['date'] = pd.to_datetime(panel_data_copy['date'])
+            pre_period_end_dt = pd.to_datetime(pre_period_end)
+            
+            control_pre_data = panel_data_copy[
+                (panel_data_copy['date'] <= pre_period_end_dt) & 
+                (panel_data_copy['geo'].isin(control_geos))
+            ]
+            
+            if len(control_pre_data) == 0:
+                return 0.0
+            
+            # Use last 30 days of pre-period for offset calculation
+            unique_dates = sorted(control_pre_data['date'].unique())
+            sample_start_date = unique_dates[max(0, len(unique_dates) - 30)]
+            sample_end_date = unique_dates[-1]
+            
+            # Get actual control sales in sample period
+            sample_data = control_pre_data[
+                (control_pre_data['date'] >= sample_start_date) &
+                (control_pre_data['date'] <= sample_end_date)
+            ]
+            
+            if len(sample_data) == 0:
+                return 0.0
+                
+            actual_sales = sample_data['sales'].sum()
+            
+            # Create temporary assignment to get STGCN prediction for control geos
+            # Treat control geos as treatment to get model prediction
+            temp_assignment = assignment_df.copy()
+            temp_assignment.loc[temp_assignment['geo'].isin(control_geos), 'assignment'] = 'treatment'
+            
+            # Store original assignment and use temporary one
+            original_assignment = self.assignment_df
+            self.assignment_df = temp_assignment
+            
+            try:
+                # Get STGCN predictions for the sample period
+                sample_start_str = sample_start_date.strftime('%Y-%m-%d')
+                sample_end_str = sample_end_date.strftime('%Y-%m-%d')
+                
+                predictions = self.predict(panel_data, sample_start_str, sample_end_str)
+                
+                if 'sales' in predictions and isinstance(predictions['sales'], np.ndarray):
+                    predicted_sales = predictions['sales'].sum()
+                    
+                    # Calculate total bias: actual - predicted
+                    total_bias = actual_sales - predicted_sales
+                    
+                    # Calculate number of control geos and days in sample
+                    n_control_geos = len(control_geos)
+                    sample_dates = [d for d in unique_dates if d >= sample_start_date]
+                    n_days_in_sample = len(sample_dates)
+                    
+                    # Calculate per-geo-per-day bias
+                    if n_control_geos > 0 and n_days_in_sample > 0:
+                        offset_per_day_per_geo = total_bias / (n_control_geos * n_days_in_sample)
+                    else:
+                        offset_per_day_per_geo = 0.0
+                    
+                    print(f"[DEBUG] Bias offset calculation:")
+                    print(f"  Actual: {actual_sales:.1f}, Predicted: {predicted_sales:.1f}")
+                    print(f"  Total bias: {total_bias:.1f}")
+                    print(f"  Control geos: {n_control_geos}, Days: {n_days_in_sample}")
+                    print(f"  Per-geo-per-day bias: {offset_per_day_per_geo:.4f}")
+                    
+                    return offset_per_day_per_geo
+                
+            except Exception as pred_error:
+                print(f"[DEBUG] Prediction for bias offset failed: {pred_error}")
+            finally:
+                # Always restore original assignment
+                self.assignment_df = original_assignment
+            
+        except Exception as e:
+            print(f"[DEBUG] Bias offset calculation failed: {e}")
+        
+        return 0.0
+    
+    def _predict_without_bias_correction(
+        self,
+        panel_data: pd.DataFrame,
+        period_start: str,
+        period_end: str
+    ) -> Dict[str, np.ndarray]:
+        """
+        Predict without applying bias correction (for offset calculation).
+        This is a simplified version of predict() that stops before bias correction.
+        """
+        # Convert dates
+        panel_data = panel_data.copy()
+        panel_data['date'] = pd.to_datetime(panel_data['date'])
+        period_start = pd.to_datetime(period_start)
+        period_end = pd.to_datetime(period_end)
+        
+        # Get control geos only
+        control_geos = self.assignment_df[
+            self.assignment_df['assignment'] == 'control'
+        ]['geo'].values
+        
+        # Get evaluation period data
+        eval_data = panel_data[
+            (panel_data['date'] >= period_start) & 
+            (panel_data['date'] <= period_end) &
+            (panel_data['geo'].isin(control_geos))
+        ].copy()
+        
+        # Simplified: for bias offset, just return the actual control group values
+        # The bias offset logic will calculate actual - actual = 0, so no offset will be applied
+        # This effectively disables the bias correction for now
+        if len(eval_data) > 0:
+            control_total_sales = eval_data['sales'].sum()
+            control_total_spend = eval_data['spend'].sum()
+            
+            return {
+                'sales': np.array([control_total_sales]),
+                'spend': np.array([control_total_spend])
+            }
+        else:
+            return {'sales': np.array([0.0]), 'spend': np.array([0.0])}
+
     def _apply_calibration_correction(self, predictions: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
         Apply calibration correction to predictions.
@@ -1620,9 +1782,70 @@ class STGCNReportingModel(BaseModel):
                 for warning in prediction_warnings:
                     print(warning)
         
+        # Bias offset correction is now handled in evaluation metrics
+        # to avoid circular dependency issues
+        
         # Apply calibration correction if enabled
         if self.offset_bias is not None or self.linear_calibration_params is not None:
             results = self._apply_calibration_correction(results)
+        
+        # Apply locked-spend diagnostic if enabled
+        if self.reporting_config.use_observed_spend:
+            # Convert results back to DataFrame format for the utility function
+            treatment_data = eval_data[eval_data['geo'].isin(treatment_geos)]
+            
+            # Create a predictions DataFrame
+            predictions_list = []
+            for i, geo in enumerate(treatment_geos):
+                for j, date in enumerate(eval_data['date'].unique()):
+                    predictions_list.append({
+                        'geo': geo,
+                        'date': date,
+                        'sales': results['sales'][i] / len(eval_data['date'].unique()),  # Distribute evenly
+                        'spend': results['spend'][i] / len(eval_data['date'].unique())   # Distribute evenly
+                    })
+            
+            predictions_df = pd.DataFrame(predictions_list)
+            
+            # Apply observed spend override
+            modified_predictions = apply_observed_spend_override(
+                predictions_df, treatment_data, self.reporting_config
+            )
+            
+            # Convert back to aggregated results format
+            results['spend'] = modified_predictions.groupby('geo')['spend'].sum().values
+        
+        # Apply per-geo-per-day bias correction if available
+        if hasattr(self, 'daily_geo_bias') and self.daily_geo_bias is not None:
+            # Count treatment geos: n_treat = len(results["sales"])
+            n_treat = len(results["sales"])
+            
+            # Count eval days: number of unique dates in period
+            panel_data_copy = panel_data.copy()
+            panel_data_copy['date'] = pd.to_datetime(panel_data_copy['date'])
+            period_start_dt = pd.to_datetime(period_start)
+            period_end_dt = pd.to_datetime(period_end)
+            
+            eval_dates = panel_data_copy[
+                (panel_data_copy['date'] >= period_start_dt) & 
+                (panel_data_copy['date'] <= period_end_dt)
+            ]['date'].unique()
+            n_days = len(eval_dates)
+            
+            # Calculate total offset = daily_geo_bias × n_treat × n_days
+            if n_treat > 0 and n_days > 0:
+                total_offset = self.daily_geo_bias * n_treat * n_days
+                
+                # Add total_offset once to results["sales"] (the aggregate array)
+                # Note: results["sales"] is already an aggregate (sum over time per geo)
+                # so we add the total offset to the sum of all geos
+                results["sales"] = results["sales"] + (total_offset / n_treat)  # Distribute equally per geo
+                
+                print(f"[DEBUG] Bias correction applied:")
+                print(f"  daily_geo_bias: {self.daily_geo_bias:.4f}")
+                print(f"  n_treat: {n_treat}, n_days: {n_days}")
+                print(f"  total_offset: {total_offset:.1f}")
+                print(f"  per_geo_offset: {total_offset / n_treat:.1f}")
         
         return results
     
@@ -1672,7 +1895,18 @@ class STGCNReportingModel(BaseModel):
         incremental_sales = actual_sales - counterfactual_sales
         incremental_spend = actual_spend - counterfactual_spend
         
-        # Calculate iROAS with spend floor to prevent ratio explosion
+        # Handle locked-spend diagnostic mode
+        if self.reporting_config.use_observed_spend:
+            # In locked-spend mode, incremental_spend will be ~0 by design
+            # Return standardized sales bias instead of traditional iROAS
+            mean_spend = actual_spend / len(treatment_geos)  # Mean spend per geo
+            if mean_spend > 0:
+                sales_bias_per_spend = incremental_sales / mean_spend
+                return sales_bias_per_spend
+            else:
+                return 0.0
+        
+        # Calculate regular iROAS with spend floor to prevent ratio explosion
         spend_floor = 1e-6
         effective_spend = incremental_spend
         if abs(effective_spend) < spend_floor:
