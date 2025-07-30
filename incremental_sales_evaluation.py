@@ -210,12 +210,28 @@ def evaluate_incremental_sales_aa(
                 
                 # Calculate confidence interval to assess model uncertainty
                 try:
-                    ci_lower, ci_upper = model.confidence_interval(
-                        panel_data,
-                        eval_period_start_str,
-                        eval_period_end_str,
-                        confidence_level=0.95
-                    )
+                    # NEW: Try incremental sales CI first
+                    if hasattr(model, 'incremental_sales_confidence_interval'):
+                        ci_lower, ci_upper = model.incremental_sales_confidence_interval(
+                            panel_data,
+                            eval_period_start_str,
+                            eval_period_end_str,
+                            confidence_level=0.95,
+                            n_bootstrap=None  # Let method choose smart default
+                        )
+                    else:
+                        # FALLBACK: Use old iROAS CI method (will show unit mismatch warning)
+                        print(f"⚠️ {method_name}: Using iROAS CI (incremental_sales_confidence_interval not implemented)")
+                        ci_lower, ci_upper = model.confidence_interval(
+                            panel_data,
+                            eval_period_start_str,
+                            eval_period_end_str,
+                            confidence_level=0.95
+                        )
+                        
+                except AttributeError as attr_e:
+                    print(f"⚠️ {method_name}: No CI method available - {attr_e}")
+                    ci_lower, ci_upper = np.nan, np.nan
                 except Exception as ci_e:
                     print(f"Could not compute CI for {method_name}: {ci_e}")
                     ci_lower, ci_upper = np.nan, np.nan

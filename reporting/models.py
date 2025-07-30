@@ -82,6 +82,47 @@ class BaseModel(ABC):
             Tuple of (lower_bound, upper_bound)
         """
         pass
+    
+    @abstractmethod
+    def incremental_sales_confidence_interval(
+        self, panel_data: pd.DataFrame, period_start: str, period_end: str,
+        confidence_level: float = 0.95, n_bootstrap: int = None, 
+        seed: Optional[int] = None
+    ) -> Tuple[float, float]:
+        """
+        Calculate confidence interval for incremental sales directly.
+        
+        Args:
+            panel_data: Long-format panel data
+            period_start: Start date of evaluation period
+            period_end: End date of evaluation period
+            confidence_level: Confidence level (default: 0.95)
+            n_bootstrap: Number of bootstrap samples (None for smart default)
+            seed: Random seed
+            
+        Returns:
+            Tuple of (lower_bound, upper_bound) for incremental sales in dollars
+        """
+        pass
+    
+    def _get_bootstrap_size(self, panel_data: pd.DataFrame, n_bootstrap: int = None) -> int:
+        """Determine appropriate bootstrap size based on data size."""
+        if n_bootstrap is not None:
+            return n_bootstrap
+        
+        # Scale with problem size
+        n_geos = panel_data['geo'].nunique()
+        n_days = panel_data['date'].nunique()
+        
+        # For small toy problems (< 20 geos, < 50 days): 100 samples
+        # For medium problems: 200-300 samples  
+        # For large problems: 500 samples
+        if n_geos < 20 and n_days < 50:
+            return 100
+        elif n_geos < 50 and n_days < 100:
+            return 200
+        else:
+            return 500
 
 
 class MeanMatchingModel(BaseModel):
@@ -254,6 +295,60 @@ class MeanMatchingModel(BaseModel):
         upper_bound = np.percentile(bootstrap_iroas, upper_percentile)
         
         return lower_bound, upper_bound
+    
+    def incremental_sales_confidence_interval(
+        self, panel_data: pd.DataFrame, period_start: str, period_end: str,
+        confidence_level: float = 0.95, n_bootstrap: int = None, 
+        seed: Optional[int] = None
+    ) -> Tuple[float, float]:
+        """
+        Bootstrap confidence interval for incremental sales by resampling control geos.
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before calculating confidence interval")
+        
+        n_bootstrap = self._get_bootstrap_size(panel_data, n_bootstrap)
+        
+        if seed is not None:
+            np.random.seed(seed)
+        
+        bootstrap_incremental_sales = []
+        
+        # Get evaluation period data
+        period_mask = (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+        eval_data = panel_data[period_mask]
+        
+        treatment_data = eval_data[eval_data['geo'].isin(self.treatment_geos)]
+        control_data = eval_data[eval_data['geo'].isin(self.control_geos)]
+        
+        treatment_daily_means = treatment_data.groupby('date')['sales'].mean()
+        
+        for _ in range(n_bootstrap):
+            # Bootstrap sample control geos
+            bootstrap_control_geos = np.random.choice(
+                self.control_geos, 
+                size=len(self.control_geos), 
+                replace=True
+            )
+            
+            # Calculate counterfactual with bootstrap sample
+            bootstrap_control_data = control_data[control_data['geo'].isin(bootstrap_control_geos)]
+            bootstrap_control_daily_means = bootstrap_control_data.groupby('date')['sales'].mean()
+            
+            # Calculate bootstrap incremental sales (NOT iROAS)
+            incremental_sales = treatment_daily_means.sum() - bootstrap_control_daily_means.sum()
+            bootstrap_incremental_sales.append(incremental_sales)
+        
+        # Calculate confidence interval
+        alpha = 1 - confidence_level
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        
+        bootstrap_incremental_sales = np.array(bootstrap_incremental_sales)
+        lower_bound = np.percentile(bootstrap_incremental_sales, lower_percentile)
+        upper_bound = np.percentile(bootstrap_incremental_sales, upper_percentile)
+        
+        return lower_bound, upper_bound
 
 
 class GBRModel(BaseModel):
@@ -313,6 +408,10 @@ class GBRModel(BaseModel):
         self.model_params['X'] = X
         self.model_params['y'] = y
         
+        # Store treatment geos for incremental sales CI
+        treatment_geos = assignment_df[assignment_df['assignment'] == 'treatment']['geo'].tolist()
+        self.model_params['treatment_geos'] = treatment_geos
+        
         return self
 
     def calculate_iroas(self, panel_data: pd.DataFrame, period_start: str,
@@ -348,6 +447,61 @@ class GBRModel(BaseModel):
         alpha = 1 - confidence_level
         lower_bound = np.percentile(bootstrap_iroas, (alpha / 2) * 100)
         upper_bound = np.percentile(bootstrap_iroas, (1 - alpha / 2) * 100)
+        return lower_bound, upper_bound
+    
+    def incremental_sales_confidence_interval(
+        self, panel_data: pd.DataFrame, period_start: str, period_end: str,
+        confidence_level: float = 0.95, n_bootstrap: int = None, 
+        seed: Optional[int] = None
+    ) -> Tuple[float, float]:
+        """
+        Calculate CI for incremental sales by bootstrapping iROAS coefficient and scaling by spend.
+        
+        Bootstrap unit: Individual geos (rows in the geo-level regression dataset).
+        Each bootstrap sample resamples geos with replacement, refits the GBR model,
+        and computes the resulting incremental sales estimate.
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before calculating CI.")
+        
+        n_bootstrap = self._get_bootstrap_size(panel_data, n_bootstrap)
+        
+        if seed is not None:
+            np.random.seed(seed)
+
+        # Get treatment geos from stored fit data (not fallback)
+        treatment_geos = self.model_params.get('treatment_geos')
+        if treatment_geos is None:
+            raise ValueError("Treatment geo assignment not found. Model may not be properly fitted.")
+        
+        # Get total treatment spend for scaling iROAS coefficient to incremental sales
+        period_mask = (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+        eval_data = panel_data[period_mask]
+        treatment_data = eval_data[eval_data['geo'].isin(treatment_geos)]
+        total_treatment_spend = treatment_data.groupby('date')['spend'].mean().sum()
+
+        # Bootstrap the geo-level regression
+        X = self.model_params['X']  # Shape: (n_geos, 3) - each row is one geo
+        y = self.model_params['y']  # Shape: (n_geos,) - each entry is one geo's post-period sales
+        
+        bootstrap_incremental_sales = []
+        for _ in range(n_bootstrap):
+            # Bootstrap unit is geos (rows of X,y)
+            # Each row represents one geo's aggregated pre/post data
+            geo_indices = np.random.choice(len(X), size=len(X), replace=True)
+            X_sample, y_sample = X.iloc[geo_indices], y.iloc[geo_indices]
+            
+            # Refit the model on the bootstrap sample of geos
+            model_sample = self.model.fit(X_sample, y_sample)
+            bootstrap_iroas_coef = model_sample.coef_[2]  # treatment_spend coefficient
+            
+            # Convert iROAS coefficient to incremental sales
+            bootstrap_incremental_sales.append(bootstrap_iroas_coef * total_treatment_spend)
+
+        # Calculate confidence interval
+        alpha = 1 - confidence_level
+        lower_bound = np.percentile(bootstrap_incremental_sales, (alpha / 2) * 100)
+        upper_bound = np.percentile(bootstrap_incremental_sales, (1 - alpha / 2) * 100)
         return lower_bound, upper_bound
 
     def predict(self, panel_data: pd.DataFrame, period_start: str,
@@ -465,6 +619,37 @@ class TBRModel(BaseModel):
         # Handle case where spend is negative
         if delta_spend < 0:
             return upper_bound, lower_bound
+        return lower_bound, upper_bound
+    
+    def incremental_sales_confidence_interval(
+        self, panel_data: pd.DataFrame, period_start: str, period_end: str,
+        confidence_level: float = 0.95, n_bootstrap: int = None, 
+        seed: Optional[int] = None
+    ) -> Tuple[float, float]:
+        """
+        Calculate CI for incremental sales based on pre-period difference variance.
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before calculating CI.")
+
+        from scipy.stats import norm
+        period_mask = (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+        n_days = panel_data[period_mask]['date'].nunique()
+
+        delta_sales, delta_spend = self._get_incremental_sales_and_spend(panel_data, period_start, period_end)
+
+        # Variance of the incremental sales estimate
+        lift_variance = (self.model_params['pre_period_diff_var']) * n_days
+        lift_std_err = np.sqrt(lift_variance)
+
+        # Z-score for confidence interval
+        alpha = 1 - confidence_level
+        z_score = norm.ppf(1 - alpha / 2)
+
+        # CI for incremental sales (NOT converted to iROAS)
+        lower_bound = delta_sales - z_score * lift_std_err
+        upper_bound = delta_sales + z_score * lift_std_err
+
         return lower_bound, upper_bound
 
     def predict(self, panel_data: pd.DataFrame, period_start: str,
@@ -638,5 +823,119 @@ class SyntheticControlModel(BaseModel):
 
         lower_bound = point_estimate - z_score * np.sqrt(lift_variance)
         upper_bound = point_estimate + z_score * np.sqrt(lift_variance)
+
+        return lower_bound, upper_bound
+    
+    def incremental_sales_confidence_interval(
+        self, panel_data: pd.DataFrame, period_start: str, period_end: str,
+        confidence_level: float = 0.95, n_bootstrap: int = None, 
+        seed: Optional[int] = None
+    ) -> Tuple[float, float]:
+        """
+        Calculate CI for incremental sales using placebo tests on control geos.
+        
+        Uses leave-one-out placebo tests: each control geo is treated as pseudo-treatment,
+        remaining control geos form pseudo-control group. The distribution of placebo
+        incremental sales estimates provides the uncertainty quantification.
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before calculating CI.")
+
+        if seed is not None:
+            np.random.seed(seed)
+
+        # Placebo test: iterate through control geos, treat one as a pseudo-treatment group
+        placebo_incremental_sales = []
+        control_geos = self.model_params['control_geos']
+        placebo_failures = 0  # Track failures
+        
+        for geo in control_geos:
+            # Define pseudo-treatment and pseudo-control groups
+            pseudo_treat_geos = [geo]
+            pseudo_control_geos = [g for g in control_geos if g != geo]
+
+            if not pseudo_control_geos:
+                placebo_failures += 1
+                continue
+
+            # Refit the model on the placebo groups
+            placebo_assignment = pd.DataFrame({
+                'geo': pseudo_treat_geos + pseudo_control_geos,
+                'assignment': ['treatment'] * len(pseudo_treat_geos) + ['control'] * len(pseudo_control_geos)
+            })
+            
+            try:
+                placebo_model = SyntheticControlModel()
+                placebo_model.fit(panel_data, placebo_assignment, period_start)
+                
+                # Calculate incremental sales directly (avoid iROAS coupling)
+                counterfactual = placebo_model.predict(panel_data, period_start, period_end)
+                
+                # Get actual sales for pseudo-treatment geo
+                period_mask = (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+                eval_data = panel_data[period_mask]
+                pseudo_treatment_data = eval_data[eval_data['geo'].isin(pseudo_treat_geos)]
+                
+                # Use same aggregation as calculate_incremental_sales()
+                actual_sales = pseudo_treatment_data.groupby('date')['sales'].mean().sum()
+                predicted_sales = counterfactual['sales'].sum()
+                incremental_sales = actual_sales - predicted_sales
+                
+                placebo_incremental_sales.append(incremental_sales)
+                
+            except Exception as e:
+                placebo_failures += 1
+                continue
+
+        # Check and log placebo failure rate
+        total_placebos = len(control_geos)
+        success_rate = len(placebo_incremental_sales) / total_placebos if total_placebos > 0 else 0
+        
+        if success_rate < 0.5:  # If more than half failed
+            print(f"⚠️ SCM placebo tests: {placebo_failures}/{total_placebos} failed ({success_rate:.1%} success rate)")
+            print("   High failure rate may indicate unreliable confidence interval")
+        
+        if len(placebo_incremental_sales) < 2:
+            if placebo_failures > 0:
+                print(f"Cannot compute CI: {placebo_failures}/{total_placebos} placebo tests failed")
+            return np.nan, np.nan
+
+        # Get point estimate directly using calculate_incremental_sales if available
+        try:
+            # Import here to avoid circular imports
+            from incremental_sales_evaluation import calculate_incremental_sales
+            
+            # Get assignment data for the actual fitted model
+            assignment_df = pd.DataFrame({
+                'geo': self.model_params['treatment_geos'] + self.model_params['control_geos'],
+                'assignment': (['treatment'] * len(self.model_params['treatment_geos']) + 
+                              ['control'] * len(self.model_params['control_geos']))
+            })
+            
+            point_incremental_sales, _, _ = calculate_incremental_sales(
+                self, panel_data, assignment_df, period_start, period_end
+            )
+            
+        except ImportError:
+            # Fallback: compute incremental sales directly (avoid iROAS coupling)
+            counterfactual = self.predict(panel_data, period_start, period_end)
+            
+            period_mask = (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+            eval_data = panel_data[period_mask]
+            treatment_data = eval_data[eval_data['geo'].isin(self.model_params['treatment_geos'])]
+            
+            actual_sales = treatment_data.groupby('date')['sales'].mean().sum()
+            predicted_sales = counterfactual['sales'].sum()
+            point_incremental_sales = actual_sales - predicted_sales
+
+        # Use placebo distribution to estimate variance around point estimate
+        placebo_variance = np.var(placebo_incremental_sales)
+        
+        from scipy.stats import norm
+        alpha = 1 - confidence_level
+        z_score = norm.ppf(1 - alpha / 2)
+
+        lower_bound = point_incremental_sales - z_score * np.sqrt(placebo_variance)
+        upper_bound = point_incremental_sales + z_score * np.sqrt(placebo_variance)
 
         return lower_bound, upper_bound

@@ -1076,7 +1076,7 @@ class STGCNReportingModel(BaseModel):
         
         try:
             # Store data for later use
-            self.assignment_df = assignment_df.copy()
+            self.assignment_data = assignment_df.copy()
             
             # Filter to pre-period data
             panel_data['date'] = pd.to_datetime(panel_data['date'])
@@ -2985,3 +2985,100 @@ RECOMMENDATION:
         denormalized = normalized_tensor * self.data_std + self.data_mean
         
         return denormalized
+    
+    def incremental_sales_confidence_interval(
+        self, panel_data: pd.DataFrame, period_start: str, period_end: str,
+        confidence_level: float = 0.95, n_bootstrap: int = None, 
+        seed: Optional[int] = None, ensemble_size: int = 10
+    ) -> Tuple[float, float]:
+        """
+        Calculate confidence interval for incremental sales using ensemble methods.
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        
+        n_bootstrap = self._get_bootstrap_size(panel_data, n_bootstrap)
+        
+        # Use existing ensemble uncertainty infrastructure but for incremental sales
+        ensemble_incremental_sales = []
+        
+        # Get treatment group data for incremental sales calculation
+        assignment_df = getattr(self, 'assignment_data', None)
+        if assignment_df is None:
+            raise ValueError("Assignment data not available. Model may not be properly fitted.")
+        
+        treatment_geos = assignment_df[assignment_df['assignment'] == 'treatment']['geo'].values
+        period_mask = (panel_data['date'] >= period_start) & (panel_data['date'] <= period_end)
+        eval_data = panel_data[period_mask]
+        treatment_data = eval_data[eval_data['geo'].isin(treatment_geos)]
+        
+        # Use same aggregation as calculate_incremental_sales()
+        actual_sales = treatment_data.groupby('date')['sales'].mean().sum()
+        
+        # Generate ensemble predictions
+        for i in range(ensemble_size):
+            try:
+                # Create ensemble member with different seed
+                ensemble_seed = seed + i if seed is not None else None
+                
+                # Use existing uncertainty_metrics infrastructure if available
+                if hasattr(self, 'uncertainty_metrics'):
+                    metrics = self.uncertainty_metrics(
+                        panel_data, period_start, period_end,
+                        metric_type='incremental_sales',
+                        ensemble_size=1,
+                        seed=ensemble_seed
+                    )
+                    if 'point_estimate' in metrics:
+                        ensemble_incremental_sales.append(metrics['point_estimate'])
+                        continue
+                
+                # Fallback: retrain model with different seed
+                temp_model = self.__class__(
+                    hidden_dim=getattr(self, 'hidden_dim', 32),
+                    num_st_blocks=getattr(self, 'num_st_blocks', 2),
+                    epochs=max(5, getattr(self, 'epochs', 10) // 2),  # Faster training
+                    seed=ensemble_seed,
+                    verbose=False
+                )
+                
+                # Fit and predict with ensemble member
+                temp_model.fit(panel_data, assignment_df, period_start)
+                counterfactual = temp_model.predict(panel_data, period_start, period_end)
+                
+                # Better handling of predicted_sales with logging
+                if isinstance(counterfactual.get('sales'), np.ndarray):
+                    predicted_sales = counterfactual['sales'].sum()
+                    if self.verbose:
+                        print(f"Ensemble {i}: Using daily predictions, sum = {predicted_sales:.2f}")
+                else:
+                    predicted_sales = counterfactual.get('sales', 0)
+                    if self.verbose:
+                        print(f"⚠️ Ensemble {i}: Fallback to scalar prediction = {predicted_sales:.2f}")
+                    # Log when this problematic fallback happens
+                    if predicted_sales == 0:
+                        print(f"⚠️ Ensemble {i}: Predicted sales is 0, may indicate model failure")
+                
+                incremental_sales = actual_sales - predicted_sales
+                ensemble_incremental_sales.append(incremental_sales)
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"Ensemble member {i} failed: {e}")
+                continue
+        
+        if len(ensemble_incremental_sales) < 2:
+            if self.verbose:
+                print(f"⚠️ Only {len(ensemble_incremental_sales)} successful ensemble members")
+            return np.nan, np.nan
+        
+        # Calculate confidence interval from ensemble
+        alpha = 1 - confidence_level
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        
+        ensemble_incremental_sales = np.array(ensemble_incremental_sales)
+        lower_bound = np.percentile(ensemble_incremental_sales, lower_percentile)
+        upper_bound = np.percentile(ensemble_incremental_sales, upper_percentile)
+        
+        return lower_bound, upper_bound
